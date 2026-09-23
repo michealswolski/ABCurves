@@ -260,7 +260,7 @@ def push_target():
 
 # ── Vision auto-detection ─────────────────────────────────────────────────────
 _det_state: dict = {
-    'running': False, 'fps': 0.0, 'hits': 0, 'last_px': None, 'thread': None, 'classes': [],
+    'running': False, 'fps': 0.0, 'hits': 0, 'last_px': None, 'thread': None, 'classes': [], 'last_error': None,
 }
 _det_lock = threading.Lock()
 
@@ -268,27 +268,62 @@ _det_lock = threading.Lock()
 def _run_detection(classes: list, confidence: float, cooldown_ms: float,
                    fov_config: dict | None, max_movement_ms: float,
                    interval_ms: float, aim_height: float):
+    # ── imports ────────────────────────────────────────────────────────────────
     try:
+        import torch
         from ultralytics import YOLOWorld
-        import mss
     except ImportError as exc:
-        logger.error("Detection deps missing — run: pip install ultralytics mss  (%s)", exc)
+        msg = f"Detection deps missing: {exc}"
+        logger.error(msg)
         with _det_lock:
             _det_state['running'] = False
+            _det_state['last_error'] = msg
         return
 
-    logger.info("Loading YOLO-World (first run downloads ~100 MB)…")
+    # ── device: prefer CUDA, fall back to CPU ──────────────────────────────────
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_fp16 = device == 'cuda'
+    logger.info("Detection device: %s%s", device.upper(), " (FP16)" if use_fp16 else "")
+
+    # ── load model ─────────────────────────────────────────────────────────────
+    logger.info("Loading YOLO-World…")
     try:
         model = YOLOWorld('yolov8s-worldv2.pt')
         model.set_classes(classes)
+        model.to(device)
+        if use_fp16:
+            model.model.half()
     except Exception as exc:
-        logger.error("YOLO-World load failed: %s", exc)
+        msg = f"YOLO-World load failed: {exc}"
+        logger.error(msg)
         with _det_lock:
             _det_state['running'] = False
+            _det_state['last_error'] = msg
         return
-    logger.info("YOLO-World ready, watching for: %s", classes)
 
-    # Prepare renderer profile once so the first fire is instant
+    # ── GPU warmup (prevents first-frame spike) ────────────────────────────────
+    logger.info("YOLO-World ready for: %s — warming up…", classes)
+    try:
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        with torch.no_grad():
+            for _ in range(3):
+                model(dummy, conf=0.1, verbose=False)
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        logger.info("Warmup done")
+    except Exception as exc:
+        logger.warning("Warmup failed (non-fatal): %s", exc)
+
+    # ── screen capture: dxcam (DirectX, fast) → mss fallback ──────────────────
+    try:
+        import dxcam
+        _use_dxcam = True
+    except ImportError:
+        import mss as _mss_mod
+        _use_dxcam = False
+    logger.info("Screen capture: %s", "dxcam (DirectX)" if _use_dxcam else "mss (fallback)")
+
+    # ── renderer profile ───────────────────────────────────────────────────────
     renderer_profile = None
     if pipeline is not None:
         try:
@@ -296,9 +331,9 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
             raw = rng.integers(-10, 10, (256, 2), dtype=np.int16)
             renderer_profile = pipeline.prepare_renderer_profile(raw)
         except Exception as exc:
-            logger.warning("Detection: renderer profile prep failed: %s", exc)
+            logger.warning("Renderer profile prep failed: %s", exc)
 
-    # FOV config → counts-per-pixel
+    # ── FOV → counts-per-pixel ─────────────────────────────────────────────────
     if fov_config:
         dpi  = float(fov_config.get('dpi', 400))
         sens = float(fov_config.get('sensitivity', 3.2554))
@@ -311,82 +346,179 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
     max_reps = math.ceil(max_movement_ms / max(interval_ms, 0.5))
     last_fire = 0.0
     frame_ts: list = []
+    crop = 640
 
-    with mss.mss() as sct:
-        mon = sct.monitors[1]
-        mw, mh = mon['width'], mon['height']
-        crop = 640
-        cap = {
-            'left':   mon['left'] + mw // 2 - crop // 2,
-            'top':    mon['top']  + mh // 2 - crop // 2,
-            'width':  crop, 'height': crop,
-        }
-        cx_rel, cy_rel = crop // 2, crop // 2
+    try:
+        if _use_dxcam:
+            import ctypes
+            mw = ctypes.windll.user32.GetSystemMetrics(0)
+            mh = ctypes.windll.user32.GetSystemMetrics(1)
+            region = (mw // 2 - crop // 2, mh // 2 - crop // 2,
+                      mw // 2 + crop // 2, mh // 2 + crop // 2)
+            cx_rel = cy_rel = crop // 2
+            cam = dxcam.create(output_color="BGR")
+            # Seed with one mss frame so the loop starts even on a static desktop.
+            # In-game the screen always changes and dxcam delivers fresh frames.
+            import mss as _mss_seed
+            with _mss_seed.MSS() as _sct:
+                _mon = _sct.monitors[1]
+                _seed_cap = {
+                    'left': _mon['left'] + mw // 2 - crop // 2,
+                    'top':  _mon['top']  + mh // 2 - crop // 2,
+                    'width': crop, 'height': crop,
+                }
+                last_frame = np.array(_sct.grab(_seed_cap))[:, :, :3]
 
-        while True:
-            with _det_lock:
-                if not _det_state['running']:
-                    break
-
-            t0 = time.time()
-            frame = np.array(sct.grab(cap))[:, :, :3]
-
-            results = model(frame, conf=confidence, verbose=False)[0]
-            boxes = results.boxes
-
-            best_px, best_dist = None, float('inf')
-            if boxes is not None and len(boxes):
-                for box in boxes.xyxy.cpu().numpy():
-                    bx  = (box[0] + box[2]) / 2
-                    by  = box[1] + (box[3] - box[1]) * aim_height
-                    dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
-                    if dist < best_dist:
-                        best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
-
-            if best_px:
-                px_x, px_y = best_px
+            while True:
                 with _det_lock:
-                    _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
-                socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
+                    if not _det_state['running']:
+                        break
+                t0 = time.time()
+                grabbed = cam.grab(region=region)
+                if grabbed is not None:
+                    last_frame = grabbed
+                frame = last_frame
 
-                now = time.time()
-                if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
-                    cx_c = round(px_x * cpp)
-                    cy_c = round(px_y * cpp)
-                    try:
-                        rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
-                        prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
-                        reports = pipeline.generate(
-                            prefix,
-                            renderer_profile=renderer_profile,
-                            target_rel_at_B=(cx_c, cy_c),
-                            target_radius=10,
-                            progress_center=0.5,
-                            seed=int(now * 1000) % 10000,
-                        ).tolist()[:max_reps]
-                        if reports:
-                            serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
-                            last_fire = now
-                            with _det_lock:
-                                _det_state['hits'] += 1
-                    except Exception as exc:
-                        logger.debug("Auto-fire error: %s", exc)
-            else:
+                with torch.no_grad():
+                    results = model(frame, conf=confidence, verbose=False)[0]
+
+                boxes = results.boxes
+                best_px, best_dist = None, float('inf')
+                if boxes is not None and len(boxes):
+                    for box in boxes.xyxy.cpu().numpy():
+                        bx  = (box[0] + box[2]) / 2
+                        by  = box[1] + (box[3] - box[1]) * aim_height
+                        dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
+                        if dist < best_dist:
+                            best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
+
+                if best_px:
+                    px_x, px_y = best_px
+                    with _det_lock:
+                        _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
+                    socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
+                    now = time.time()
+                    if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+                        cx_c = round(px_x * cpp)
+                        cy_c = round(px_y * cpp)
+                        try:
+                            rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
+                            prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
+                            reports = pipeline.generate(
+                                prefix,
+                                renderer_profile=renderer_profile,
+                                target_rel_at_B=(cx_c, cy_c),
+                                target_radius=10,
+                                progress_center=0.5,
+                                seed=int(now * 1000) % 10000,
+                            ).tolist()[:max_reps]
+                            if reports:
+                                serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
+                                last_fire = now
+                                with _det_lock:
+                                    _det_state['hits'] += 1
+                        except Exception as exc:
+                            logger.debug("Auto-fire error: %s", exc)
+                else:
+                    with _det_lock:
+                        _det_state['last_px'] = None
+
+                elapsed = time.time() - t0
+                frame_ts.append(elapsed)
+                if len(frame_ts) > 30:
+                    frame_ts.pop(0)
+                fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
                 with _det_lock:
-                    _det_state['last_px'] = None
+                    _det_state['fps'] = fps
 
-            elapsed = time.time() - t0
-            frame_ts.append(elapsed)
-            if len(frame_ts) > 30:
-                frame_ts.pop(0)
-            fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
-            with _det_lock:
-                _det_state['fps'] = fps
+            del cam
+        else:
+            with _mss_mod.MSS() as sct:
+                mon = sct.monitors[1]
+                mw, mh = mon['width'], mon['height']
+                cap = {
+                    'left':   mon['left'] + mw // 2 - crop // 2,
+                    'top':    mon['top']  + mh // 2 - crop // 2,
+                    'width':  crop, 'height': crop,
+                }
+                cx_rel = cy_rel = crop // 2
+
+                while True:
+                    with _det_lock:
+                        if not _det_state['running']:
+                            break
+                    t0 = time.time()
+                    frame = np.array(sct.grab(cap))[:, :, :3]
+
+                    with torch.no_grad():
+                        results = model(frame, conf=confidence, verbose=False)[0]
+
+                    boxes = results.boxes
+                    best_px, best_dist = None, float('inf')
+                    if boxes is not None and len(boxes):
+                        for box in boxes.xyxy.cpu().numpy():
+                            bx  = (box[0] + box[2]) / 2
+                            by  = box[1] + (box[3] - box[1]) * aim_height
+                            dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
+                            if dist < best_dist:
+                                best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
+
+                    if best_px:
+                        px_x, px_y = best_px
+                        with _det_lock:
+                            _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
+                        socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
+                        now = time.time()
+                        if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+                            cx_c = round(px_x * cpp)
+                            cy_c = round(px_y * cpp)
+                            try:
+                                rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
+                                prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
+                                reports = pipeline.generate(
+                                    prefix,
+                                    renderer_profile=renderer_profile,
+                                    target_rel_at_B=(cx_c, cy_c),
+                                    target_radius=10,
+                                    progress_center=0.5,
+                                    seed=int(now * 1000) % 10000,
+                                ).tolist()[:max_reps]
+                                if reports:
+                                    serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
+                                    last_fire = now
+                                    with _det_lock:
+                                        _det_state['hits'] += 1
+                            except Exception as exc:
+                                logger.debug("Auto-fire error: %s", exc)
+                    else:
+                        with _det_lock:
+                            _det_state['last_px'] = None
+
+                    elapsed = time.time() - t0
+                    frame_ts.append(elapsed)
+                    if len(frame_ts) > 30:
+                        frame_ts.pop(0)
+                    fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
+                    with _det_lock:
+                        _det_state['fps'] = fps
+
+    except Exception as exc:
+        msg = f"Detection loop crashed: {exc}"
+        logger.error(msg, exc_info=True)
+        with _det_lock:
+            _det_state['running'] = False
+            _det_state['last_error'] = msg
 
     with _det_lock:
         _det_state['running'] = False
         _det_state['thread'] = None
     logger.info("Detection loop stopped")
+
+
+@app.route('/api/detection/last-error')
+def detection_last_error():
+    with _det_lock:
+        return jsonify({'error': _det_state.get('last_error')})
 
 
 @app.route('/api/detection/start', methods=['POST'])
