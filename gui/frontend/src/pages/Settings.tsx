@@ -127,6 +127,8 @@ export default function Settings() {
     Number(localStorage.getItem('movement_smoothness') || 1))
   const [defaultIntervalMs, setDefaultIntervalMs] = useState(() =>
     Number(localStorage.getItem('default_interval_ms') || 1.0))
+  const [maxMovementMs, setMaxMovementMs] = useState(() =>
+    Number(localStorage.getItem('max_movement_ms') || 120))
 
   // Tracking / target settings
   const [distancePriority, setDistancePriority] = useState(() =>
@@ -178,10 +180,11 @@ export default function Settings() {
     setTimeout(() => setSavedFeedback(''), 2000)
   }
 
-  const saveMovement = (s: number, i: number) => {
+  const saveMovement = (s: number, i: number, maxMs: number) => {
     try {
       localStorage.setItem('movement_smoothness', String(s))
       localStorage.setItem('default_interval_ms', String(i))
+      localStorage.setItem('max_movement_ms', String(maxMs))
     } catch {}
     flashSaved('Movement settings saved')
   }
@@ -273,7 +276,7 @@ export default function Settings() {
               <label className="form-label">Report Interval (ms)</label>
               <input className="form-input" type="number" value={defaultIntervalMs}
                 min={0.1} max={10} step={0.1}
-                onChange={e => { setDefaultIntervalMs(Number(e.target.value)); saveMovement(smoothness, Number(e.target.value)) }} />
+                onChange={e => { setDefaultIntervalMs(Number(e.target.value)); saveMovement(smoothness, Number(e.target.value), maxMovementMs) }} />
               <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
                 1.0 ms = 1 kHz (MAKCU max). Higher = smoother but slower.
               </span>
@@ -287,11 +290,25 @@ export default function Settings() {
               </div>
               <input type="range" min={1} max={4} step={1} value={smoothness}
                 style={{ width: '100%', accentColor: '#00d4ff' }}
-                onChange={e => { setSmoothness(Number(e.target.value)); saveMovement(Number(e.target.value), defaultIntervalMs) }} />
+                onChange={e => { setSmoothness(Number(e.target.value)); saveMovement(Number(e.target.value), defaultIntervalMs, maxMovementMs) }} />
               <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
                 Interpolation between generated delta pairs
               </span>
             </div>
+          </div>
+          <div className="form-group" style={{ marginTop: 10, marginBottom: 0 }}>
+            <label className="form-label">Max Movement Duration</label>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)' }}>Fast</span>
+              <span style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 700 }}>{maxMovementMs} ms</span>
+              <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)' }}>Slow</span>
+            </div>
+            <input type="range" min={40} max={400} step={10} value={maxMovementMs}
+              style={{ width: '100%', accentColor: '#00d4ff' }}
+              onChange={e => { setMaxMovementMs(Number(e.target.value)); saveMovement(smoothness, defaultIntervalMs, Number(e.target.value)) }} />
+            <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
+              Caps continuation length — competitive: 80–150 ms, casual: 200–400 ms
+            </span>
           </div>
         </div>
 

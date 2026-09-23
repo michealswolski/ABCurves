@@ -276,17 +276,26 @@ export default function Inference() {
     return () => window.removeEventListener('keydown', handler)
   }, [loading, prefixError, runInference])
 
+  // Cap continuation to a max movement duration so a 370-report output
+  // doesn't take 370ms — competitive flicks should land in 80–150ms.
+  const maxReports = Math.ceil(Number(localStorage.getItem('max_movement_ms') || 120) / Math.max(intervalMs, 0.5))
+  const trimmedContinuation = useMemo((): [number, number][] => {
+    if (!result?.continuation) return []
+    return (result.continuation as [number, number][]).slice(0, maxReports)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result, maxReports])
+
   const sendToMakcu = useCallback(async () => {
-    if (!result?.continuation) return
+    if (!trimmedContinuation.length) return
     setSending(true); setSendProgress(null); setError('')
     try {
-      const res = await api.serial.sendReports(result.continuation as [number, number][], intervalMs)
+      const res = await api.serial.sendReports(trimmedContinuation, intervalMs)
       if (!res.ok) setError((res as any).error ?? 'Send failed')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Send to MAKCU failed')
       setSending(false)
     }
-  }, [result, intervalMs])
+  }, [trimmedContinuation, intervalMs])
 
   const exportCSV = useCallback(() => {
     if (!result) return
@@ -646,7 +655,11 @@ export default function Inference() {
 
             {result && (
               <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.35)', marginTop: 8, textAlign: 'center' }}>
-                {result.stats.continuation_length} reports · ~{(result.stats.continuation_length * intervalMs).toFixed(0)} ms total
+                {trimmedContinuation.length} reports
+                {trimmedContinuation.length < result.stats.continuation_length && (
+                  <span style={{ color: 'rgba(0,212,255,0.4)' }}> (trimmed from {result.stats.continuation_length})</span>
+                )}
+                {' '}· ~{(trimmedContinuation.length * intervalMs).toFixed(0)} ms total
               </div>
             )}
           </div>
