@@ -8,6 +8,7 @@ import {
   Info,
   Zap,
   Usb,
+  Settings,
 } from 'lucide-react'
 
 const NAV = [
@@ -17,6 +18,7 @@ const NAV = [
   { to: '/training',  icon: Cpu,             label: 'Training'   },
   { to: '/metrics',   icon: BarChart2,       label: 'Metrics'    },
   { to: '/about',     icon: Info,            label: 'About'      },
+  { to: '/settings',  icon: Settings,        label: 'Settings'   },
 ]
 
 export default function Sidebar() {
@@ -134,7 +136,7 @@ export default function Sidebar() {
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <span className="dot-live" style={{ width: 5, height: 5 }} />
-          v1.5.1 · Academic Research
+          v1.6.0 · Academic Research
         </div>
       </div>
     </div>

@@ -7,6 +7,7 @@ interface MovementCanvasProps {
   targetRadius?: number
   width?: number
   height?: number
+  onTargetClick?: (x: number, y: number) => void
 }
 
 function integrateDeltas(deltas: [number, number][], sx = 0, sy = 0): [number, number][] {
@@ -174,10 +175,12 @@ function drawTarget(
 export default function MovementCanvas({
   prefix, continuation, target,
   targetRadius = 20, width = 620, height = 400,
+  onTargetClick,
 }: MovementCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const animRef = useRef<number>(0)
   const [animating, setAnimating] = useState(false)
+  const transformRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 })
 
   const drawStatic = useCallback(() => {
     const canvas = canvasRef.current
@@ -192,6 +195,7 @@ export default function MovementCanvas({
 
     const all: [number, number][] = [...prefixPts, ...contPts]
     const { scale: s, offsetX: ox, offsetY: oy } = fitToCanvas(all, target, width, height)
+    transformRef.current = { scale: s, offsetX: ox, offsetY: oy }
 
     if (target) drawTarget(ctx, target, s, ox, oy, targetRadius)
 
@@ -291,6 +295,31 @@ export default function MovementCanvas({
   useEffect(() => { drawStatic() }, [drawStatic])
   useEffect(() => () => cancelAnimationFrame(animRef.current), [])
 
+  // Keyboard shortcut: R = replay animation
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+      if (e.key === 'r' || e.key === 'R') playAnimation()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [playAnimation])
+
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!onTargetClick) return
+    const canvas = canvasRef.current!
+    const rect = canvas.getBoundingClientRect()
+    const scaleX = canvas.width / rect.width
+    const scaleY = canvas.height / rect.height
+    const canvasX = (e.clientX - rect.left) * scaleX
+    const canvasY = (e.clientY - rect.top) * scaleY
+    const { scale: s, offsetX: ox, offsetY: oy } = transformRef.current
+    const worldX = Math.round((canvasX - ox) / s)
+    const worldY = Math.round((canvasY - oy) / s)
+    onTargetClick(worldX, worldY)
+  }, [onTargetClick])
+
   const isEmpty = prefix.length === 0 && continuation.length === 0
 
   return (
@@ -302,12 +331,23 @@ export default function MovementCanvas({
         border: '1px solid rgba(0,212,255,0.15)',
         background: '#00030e',
         boxShadow: '0 0 30px rgba(0,212,255,0.06), inset 0 0 30px rgba(0,0,0,0.5)',
+        cursor: onTargetClick ? 'crosshair' : 'default',
       }}>
+        {onTargetClick && (
+          <div style={{
+            position: 'absolute', top: 8, right: 10, zIndex: 2,
+            fontSize: 10, color: 'rgba(255,45,120,0.5)', fontFamily: 'JetBrains Mono',
+            pointerEvents: 'none',
+          }}>
+            Click to set target
+          </div>
+        )}
         <canvas
           ref={canvasRef}
           width={width}
           height={height}
           style={{ display: 'block', maxWidth: '100%' }}
+          onClick={onTargetClick ? handleCanvasClick : undefined}
         />
         {isEmpty && (
           <div style={{

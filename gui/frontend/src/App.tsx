@@ -7,6 +7,7 @@ import Training from './pages/Training'
 import Metrics from './pages/Metrics'
 import About from './pages/About'
 import Device from './pages/Device'
+import Settings from './pages/Settings'
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
             <Route path="/training" element={<Training />} />
             <Route path="/metrics" element={<Metrics />} />
             <Route path="/about" element={<About />} />
+            <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
       </div>

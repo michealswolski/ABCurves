@@ -3,7 +3,7 @@ import {
   Usb, RefreshCw, Zap, ZapOff, Send, Mouse, ChevronRight,
   Activity, AlertCircle, CheckCircle2, Circle,
 } from 'lucide-react'
-import { api, SerialPort, SerialStatus } from '../services/api'
+import { api, SerialPort, SerialStatus, MacroEvent } from '../services/api'
 
 const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
 const PROTOCOLS: { value: string; label: string; desc: string }[] = [
@@ -12,8 +12,6 @@ const PROTOCOLS: { value: string; label: string; desc: string }[] = [
   { value: 'raw_binary', label: 'Raw Binary',       desc: '4-byte int16 pairs [dx, dy] per report' },
 ]
 
-const JOG_STEP = 20  // pixels per jog button press
-
 export default function Device() {
   const [ports, setPorts] = useState<SerialPort[]>([])
   const [status, setStatus] = useState<SerialStatus | null>(null)
@@ -21,11 +19,32 @@ export default function Device() {
   const [connecting, setConnecting] = useState(false)
 
   const [selectedPort, setSelectedPort] = useState('')
-  const [selectedBaud, setSelectedBaud] = useState(115200)
+  const [selectedBaud, setSelectedBaud] = useState(() =>
+    Number(localStorage.getItem('defaultBaud') || 115200)
+  )
   const [selectedProto, setSelectedProto] = useState<'text' | 'ch9329' | 'raw_binary'>('text')
 
   const [log, setLog] = useState<{ ts: string; cls: string; msg: string }[]>([])
   const [txProgress, setTxProgress] = useState<{ sent: number; total: number } | null>(null)
+
+  // Jog speed
+  const [jogStep, setJogStep] = useState(20)
+
+  // Auto-reconnect
+  const [autoReconnect, setAutoReconnect] = useState(false)
+  const wasConnectedRef = useRef(false)
+  const reconnectingRef = useRef(false)
+
+  // Macro recorder
+  const [macroRecording, setMacroRecording] = useState(false)
+  const [macroEvents, setMacroEvents] = useState<MacroEvent[]>([])
+  const [replayingMacro, setReplayingMacro] = useState(false)
+  const macroRecordingRef = useRef(false)
+  const macroEventsRef = useRef<MacroEvent[]>([])
+
+  // Keep refs in sync
+  useEffect(() => { macroRecordingRef.current = macroRecording }, [macroRecording])
+  useEffect(() => { macroEventsRef.current = macroEvents }, [macroEvents])
 
   const logRef = useRef<HTMLDivElement>(null)
 
@@ -34,12 +53,11 @@ export default function Device() {
     setLog(prev => [...prev.slice(-199), { ts, cls, msg }])
   }, [])
 
-  // Auto-scroll console
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
   }, [log])
 
-  // WebSocket for serial events
+  // WebSocket for serial events + macro events
   useEffect(() => {
     let sock: WebSocket | null = null
     try {
@@ -58,6 +76,13 @@ export default function Device() {
               if (data.ok) addLog(`✓ Sent ${data.reports_sent} reports — ${data.stats.bytes_sent} bytes`, 'log-success')
               else addLog(`✗ Transmission error: ${data.errors} errors`, 'log-error')
               refreshStatus()
+            } else if (event === 'macro_progress') {
+              setTxProgress({ sent: data.done, total: data.total })
+            } else if (event === 'macro_done') {
+              setTxProgress(null)
+              setReplayingMacro(false)
+              if (data.ok) addLog(`✓ Macro replayed: ${data.events_replayed} events`, 'log-success')
+              else addLog(`✗ Macro errors: ${data.errors}`, 'log-error')
             }
           } catch { /* ignore parse errors */ }
         }
@@ -87,10 +112,40 @@ export default function Device() {
     try {
       const s = await api.serial.status()
       setStatus(s)
-    } catch { /* ignore */ }
+      return s
+    } catch { return null }
   }, [])
 
+  // Initial scan + status
   useEffect(() => { scanPorts(); refreshStatus() }, [])
+
+  // Auto-reconnect polling
+  useEffect(() => {
+    const poll = async () => {
+      const s = await refreshStatus()
+      if (!s) return
+      if (wasConnectedRef.current && !s.connected && autoReconnect && !reconnectingRef.current) {
+        reconnectingRef.current = true
+        addLog('⚡ Device disconnected — attempting auto-reconnect…', 'log-warn')
+        try {
+          const r = await api.serial.reconnect()
+          if (r.ok) {
+            addLog('✓ Auto-reconnected!', 'log-success')
+          } else {
+            addLog(`Auto-reconnect failed: ${r.error}`, 'log-error')
+          }
+        } catch {
+          addLog('Auto-reconnect attempt failed', 'log-error')
+        } finally {
+          reconnectingRef.current = false
+        }
+        await refreshStatus()
+      }
+      wasConnectedRef.current = s.connected
+    }
+    const t = setInterval(poll, 3000)
+    return () => clearInterval(t)
+  }, [autoReconnect, addLog, refreshStatus])
 
   const handleConnect = async () => {
     if (!selectedPort) { addLog('Select a port first', 'log-warn'); return }
@@ -109,20 +164,54 @@ export default function Device() {
   const handleDisconnect = async () => {
     addLog('Disconnecting…', 'log-dim')
     await api.serial.disconnect()
+    wasConnectedRef.current = false
     await refreshStatus()
     addLog('Disconnected', 'log-warn')
   }
 
+  const recordEvent = useCallback((event: MacroEvent) => {
+    if (macroRecordingRef.current) {
+      setMacroEvents(prev => [...prev, event])
+    }
+  }, [])
+
   const jog = async (dx: number, dy: number) => {
     const r = await api.serial.sendSingle(dx, dy)
-    if (r.ok) addLog(`Jog (${dx > 0 ? '+' : ''}${dx}, ${dy > 0 ? '+' : ''}${dy})`, 'log-dim')
-    else addLog(`Jog failed: ${r.error}`, 'log-error')
+    if (r.ok) {
+      addLog(`Jog (${dx > 0 ? '+' : ''}${dx}, ${dy > 0 ? '+' : ''}${dy})`, 'log-dim')
+      recordEvent({ type: 'move', dx, dy })
+    } else addLog(`Jog failed: ${r.error}`, 'log-error')
   }
 
   const click = async (btn: 'left' | 'right' | 'middle') => {
     const r = await api.serial.click(btn)
-    if (r.ok) addLog(`Click ${btn}`, 'log-success')
-    else addLog(`Click failed: ${r.error}`, 'log-error')
+    if (r.ok) {
+      addLog(`Click ${btn}`, 'log-success')
+      recordEvent({ type: 'click', button: btn })
+    } else addLog(`Click failed: ${r.error}`, 'log-error')
+  }
+
+  const startRecording = () => {
+    setMacroEvents([])
+    setMacroRecording(true)
+    addLog('● Recording started — jog and click events are being captured', 'log-warn')
+  }
+
+  const stopRecording = () => {
+    setMacroRecording(false)
+    addLog(`■ Recording stopped — ${macroEventsRef.current.length} events captured`, 'log-success')
+  }
+
+  const replayMacro = async () => {
+    if (!connected || macroEvents.length === 0) return
+    setReplayingMacro(true)
+    addLog(`▶ Replaying ${macroEvents.length} macro events…`, 'log-dim')
+    try {
+      await api.serial.replayMacro(macroEvents)
+    } catch (e) {
+      addLog(`Macro replay error: ${e}`, 'log-error')
+      setReplayingMacro(false)
+    }
   }
 
   const connected = status?.connected ?? false
@@ -184,7 +273,6 @@ export default function Device() {
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
             <div className="section-header"><Usb size={13} /> Connection Config</div>
 
-            {/* Port picker */}
             <div className="form-group">
               <label className="form-label">COM Port</label>
               <div style={{ display: 'flex', gap: 8 }}>
@@ -213,7 +301,6 @@ export default function Device() {
               )}
             </div>
 
-            {/* Baud */}
             <div className="form-group">
               <label className="form-label">Baud Rate</label>
               <select className="form-input" value={selectedBaud}
@@ -222,7 +309,6 @@ export default function Device() {
               </select>
             </div>
 
-            {/* Protocol */}
             <div className="form-group">
               <label className="form-label">Protocol</label>
               <select className="form-input" value={selectedProto}
@@ -235,6 +321,38 @@ export default function Device() {
               <span style={{ fontSize: 11, color: 'rgba(126,200,227,0.4)' }}>
                 {PROTOCOLS.find(p => p.value === selectedProto)?.desc}
               </span>
+            </div>
+
+            {/* Auto-reconnect toggle */}
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '10px 0', borderTop: '1px solid rgba(0,212,255,0.07)', marginTop: 4,
+            }}>
+              <div>
+                <div style={{ fontSize: 12, color: 'rgba(0,212,255,0.7)', fontWeight: 600 }}>Auto-Reconnect</div>
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
+                  Re-connect automatically if device disconnects
+                </div>
+              </div>
+              <button
+                onClick={() => setAutoReconnect(v => !v)}
+                style={{
+                  width: 44, height: 24, borderRadius: 12,
+                  background: autoReconnect ? 'rgba(57,255,20,0.25)' : 'rgba(0,212,255,0.08)',
+                  border: `1px solid ${autoReconnect ? 'rgba(57,255,20,0.4)' : 'rgba(0,212,255,0.15)'}`,
+                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s ease',
+                  boxShadow: autoReconnect ? '0 0 8px rgba(57,255,20,0.2)' : 'none',
+                }}
+              >
+                <div style={{
+                  width: 16, height: 16, borderRadius: '50%',
+                  background: autoReconnect ? '#39ff14' : 'rgba(126,200,227,0.3)',
+                  position: 'absolute', top: 3,
+                  left: autoReconnect ? 24 : 4,
+                  transition: 'all 0.2s ease',
+                  boxShadow: autoReconnect ? '0 0 6px #39ff14' : 'none',
+                }} />
+              </button>
             </div>
 
             <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
@@ -308,7 +426,7 @@ export default function Device() {
           )}
         </div>
 
-        {/* ── Right: Manual control + console ── */}
+        {/* ── Right: Manual control + macro + console ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
           {/* Jog pad */}
@@ -327,11 +445,28 @@ export default function Device() {
               </div>
             )}
 
+            {/* Jog speed slider */}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <label className="form-label" style={{ marginBottom: 0 }}>Jog Step</label>
+                <span style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 700 }}>
+                  {jogStep}px
+                </span>
+              </div>
+              <input type="range" min={1} max={100} step={1}
+                value={jogStep} onChange={e => setJogStep(Number(e.target.value))}
+                style={{ width: '100%', accentColor: '#00d4ff' }} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10,
+                color: 'rgba(126,200,227,0.3)', marginTop: 2 }}>
+                <span>1px (fine)</span><span>100px (coarse)</span>
+              </div>
+            </div>
+
             {/* D-pad jog */}
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 16 }}>
-              <JogBtn label="▲" onClick={() => jog(0, -JOG_STEP)} disabled={!connected} />
+              <JogBtn label="▲" onClick={() => jog(0, -jogStep)} disabled={!connected} />
               <div style={{ display: 'flex', gap: 6 }}>
-                <JogBtn label="◀" onClick={() => jog(-JOG_STEP, 0)} disabled={!connected} />
+                <JogBtn label="◀" onClick={() => jog(-jogStep, 0)} disabled={!connected} />
                 <div style={{
                   width: 48, height: 48, borderRadius: 8,
                   background: 'rgba(0,212,255,0.05)',
@@ -339,13 +474,9 @@ export default function Device() {
                   display: 'flex', alignItems: 'center', justifyContent: 'center',
                   color: 'rgba(0,212,255,0.3)', fontSize: 11,
                 }}>JOG</div>
-                <JogBtn label="▶" onClick={() => jog(JOG_STEP, 0)} disabled={!connected} />
+                <JogBtn label="▶" onClick={() => jog(jogStep, 0)} disabled={!connected} />
               </div>
-              <JogBtn label="▼" onClick={() => jog(0, JOG_STEP)} disabled={!connected} />
-            </div>
-
-            <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.35)', textAlign: 'center', marginBottom: 16 }}>
-              Step size: {JOG_STEP} px per press
+              <JogBtn label="▼" onClick={() => jog(0, jogStep)} disabled={!connected} />
             </div>
 
             {/* Click buttons */}
@@ -361,13 +492,94 @@ export default function Device() {
               ))}
             </div>
 
-            {/* Send raw */}
             <RawSender connected={connected} onSend={(dx, dy) => {
               api.serial.sendSingle(dx, dy).then(r => {
-                if (r.ok) addLog(`Sent (${dx}, ${dy})`, 'log-success')
-                else addLog(`Send failed: ${r.error}`, 'log-error')
+                if (r.ok) {
+                  addLog(`Sent (${dx}, ${dy})`, 'log-success')
+                  recordEvent({ type: 'move', dx, dy })
+                } else addLog(`Send failed: ${r.error}`, 'log-error')
               })
             }} />
+          </div>
+
+          {/* Macro Recorder */}
+          <div className="card" style={{
+            background: 'rgba(5,5,18,0.9)',
+            border: macroRecording ? '1px solid rgba(255,45,120,0.3)' : undefined,
+          }}>
+            <div className="section-header">
+              <span style={{ color: macroRecording ? '#ff2d78' : undefined }}>
+                {macroRecording ? '● ' : ''}Macro Recorder
+              </span>
+              {macroRecording && (
+                <span style={{
+                  marginLeft: 8, fontSize: 10, padding: '2px 8px', borderRadius: 10,
+                  background: 'rgba(255,45,120,0.15)', color: '#ff2d78',
+                  border: '1px solid rgba(255,45,120,0.3)',
+                  animation: 'pulse-dot 1s ease-in-out infinite',
+                }}>RECORDING</span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+              {!macroRecording ? (
+                <button className="btn btn-danger"
+                  style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
+                  onClick={startRecording} disabled={!connected}>
+                  ● Record
+                </button>
+              ) : (
+                <button className="btn btn-secondary"
+                  style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
+                  onClick={stopRecording}>
+                  ■ Stop
+                </button>
+              )}
+              <button className="btn btn-primary"
+                style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
+                onClick={replayMacro}
+                disabled={!connected || macroEvents.length === 0 || replayingMacro || macroRecording}>
+                {replayingMacro
+                  ? <><span className="spinner" style={{ width: 12, height: 12 }} /> Replaying…</>
+                  : `▶ Replay (${macroEvents.length})`}
+              </button>
+              <button className="btn btn-secondary"
+                style={{ padding: '8px 12px' }}
+                onClick={() => { setMacroEvents([]); setMacroRecording(false) }}
+                disabled={macroEvents.length === 0}
+                title="Clear macro">
+                ✕
+              </button>
+            </div>
+
+            {macroEvents.length > 0 ? (
+              <div style={{
+                background: 'rgba(0,4,14,0.9)', borderRadius: 4, padding: '6px 8px',
+                maxHeight: 80, overflowY: 'auto',
+                border: '1px solid rgba(0,212,255,0.08)',
+                fontFamily: 'JetBrains Mono', fontSize: 10,
+              }}>
+                {macroEvents.slice(-8).map((ev, i) => (
+                  <div key={i} style={{
+                    color: ev.type === 'click' ? '#ff8c00'
+                           : ev.type === 'pause' ? '#b44aff'
+                           : 'rgba(0,212,255,0.6)',
+                    lineHeight: 1.6,
+                  }}>
+                    {ev.type === 'move' ? `M ${ev.dx},${ev.dy}`
+                     : ev.type === 'click' ? `CLICK ${ev.button}`
+                     : `PAUSE ${ev.ms}ms`}
+                  </div>
+                ))}
+                {macroEvents.length > 8 && (
+                  <div style={{ color: 'rgba(126,200,227,0.3)' }}>+{macroEvents.length - 8} more…</div>
+                )}
+              </div>
+            ) : (
+              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.25)', textAlign: 'center', padding: '8px 0' }}>
+                {connected ? 'Press Record then jog/click to capture a macro' : 'Connect device to use macro recorder'}
+              </div>
+            )}
           </div>
 
           {/* TX progress */}
@@ -376,7 +588,7 @@ export default function Device() {
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 12 }}>
                 <span style={{ color: 'rgba(0,212,255,0.7)' }}>
                   <Send size={12} style={{ marginRight: 6 }} />
-                  Transmitting to MAKCU…
+                  {replayingMacro ? 'Replaying macro…' : 'Transmitting to MAKCU…'}
                 </span>
                 <span style={{ fontFamily: 'JetBrains Mono', color: '#00d4ff' }}>
                   {txProgress.sent} / {txProgress.total}

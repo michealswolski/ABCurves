@@ -14,7 +14,39 @@ export interface InferenceRequest {
 export interface InferenceResult {
   success: boolean
   continuation: [number, number][]
+  latency_ms?: number
   stats: { prefix_length: number; continuation_length: number; total_length: number }
+}
+
+export interface BatchInferenceResult {
+  success: boolean
+  n: number
+  results: Array<{
+    index: number
+    seed: number
+    latency_ms: number
+    continuation: [number, number][]
+    length: number
+  }>
+}
+
+export interface LatencyEntry {
+  t: string
+  ms: number
+}
+
+export interface ModelInfo {
+  models: Array<{ name: string; size_mb: number; ext: string }>
+  count: number
+  pipeline_ready: boolean
+}
+
+export interface MacroEvent {
+  type: 'move' | 'click' | 'pause'
+  dx?: number
+  dy?: number
+  button?: 'left' | 'right' | 'middle'
+  ms?: number
 }
 
 export interface HealthResponse {
@@ -111,8 +143,11 @@ export const api = {
   }>('/example-data'),
 
   // Inference
-  runInference:     (req: InferenceRequest) => post<InferenceResult>('/inference', req),
-  inferenceHistory: (limit = 10) => get<{ count: number; history: unknown[] }>(`/inference-history?limit=${limit}`),
+  runInference:       (req: InferenceRequest) => post<InferenceResult>('/inference', req),
+  inferenceHistory:   (limit = 10) => get<{ count: number; history: unknown[] }>(`/inference-history?limit=${limit}`),
+  latencyHistory:     (limit = 50) => get<{ history: LatencyEntry[] }>(`/inference/latency-history?limit=${limit}`),
+  batchInference:     (req: InferenceRequest & { n: number }) => post<BatchInferenceResult>('/inference/batch', req),
+  modelsInfo:         () => get<ModelInfo>('/models/info'),
 
   // Serial / MAKCU
   serial: {
@@ -126,8 +161,12 @@ export const api = {
     sendSingle:  (dx: number, dy: number) =>
                    post<{ ok: boolean; error?: string }>('/serial/send-single', { dx, dy }),
     click:       (button: 'left' | 'right' | 'middle' = 'left') =>
-                   post<{ ok: boolean }>('/serial/click', { button }),
-    resetStats:  () => post<{ ok: boolean }>('/serial/reset-stats'),
+                   post<{ ok: boolean; error?: string }>('/serial/click', { button }),
+    resetStats:   () => post<{ ok: boolean }>('/serial/reset-stats'),
+    reconnect:    () => post<{ ok: boolean; error?: string }>('/serial/reconnect'),
+    replayMacro:  (events: MacroEvent[]) =>
+                    post<{ ok: boolean; message: string; total: number }>(
+                      '/serial/macro/replay', { events }),
   },
 
   // Training

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import MovementCanvas from '../components/MovementCanvas'
 import { api, InferenceResult, SerialStatus } from '../services/api'
-import { Send, Usb, ZapOff } from 'lucide-react'
+import { Send, Usb, ZapOff, Download, Lock, Unlock, Layers } from 'lucide-react'
 
 const EXAMPLE_PREFIX: [number, number][] = [
   [3,1],[4,2],[5,2],[6,3],[7,3],[8,3],[9,3],[10,4],[10,4],[11,4],
@@ -53,12 +53,19 @@ export default function Inference() {
   const [radius, setRadius] = useState(20)
   const [progressCenter, setProgressCenter] = useState(0.5)
   const [seed, setSeed] = useState(42)
+  const [seedLocked, setSeedLocked] = useState(true)
   const [prefixText, setPrefixText] = useState(JSON.stringify(EXAMPLE_PREFIX.slice(0, 10)))
   const [prefix, setPrefix] = useState<[number, number][]>(EXAMPLE_PREFIX)
   const [prefixError, setPrefixError] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<InferenceResult | null>(null)
+
+  // Batch inference
+  const [batchMode, setBatchMode] = useState(false)
+  const [batchN, setBatchN] = useState(3)
+  const [batchResults, setBatchResults] = useState<Array<{index: number; seed: number; latency_ms: number; continuation: [number,number][]; length: number}>>([])
+  const [selectedBatch, setSelectedBatch] = useState(0)
 
   // MAKCU state
   const [serialStatus, setSerialStatus] = useState<SerialStatus | null>(null)
@@ -70,14 +77,12 @@ export default function Inference() {
     setPrefixText(JSON.stringify(EXAMPLE_PREFIX))
     setPrefix(EXAMPLE_PREFIX)
     setTarget(EXAMPLE_TARGET)
-    // Poll serial status
     const poll = () => api.serial.status().then(s => setSerialStatus(s)).catch(() => {})
     poll()
     const t = setInterval(poll, 3000)
     return () => clearInterval(t)
   }, [])
 
-  // WebSocket for send progress
   useEffect(() => {
     let sock: WebSocket | null = null
     try {
@@ -121,31 +126,124 @@ export default function Inference() {
   const runInference = useCallback(async () => {
     if (prefix.length === 0) { setError('Prefix is empty'); return }
     setLoading(true); setError('')
+    setBatchResults([])
+
+    const actualSeed = seedLocked ? seed : Math.floor(Math.random() * 100000)
+    if (!seedLocked) setSeed(actualSeed)
+
     try {
-      const res = await api.runInference({
-        prefix, target, target_radius: radius, progress_center: progressCenter, seed,
-      })
-      setResult(res)
+      if (batchMode) {
+        const res = await api.batchInference({
+          prefix, target, target_radius: radius, progress_center: progressCenter,
+          seed: actualSeed, n: batchN,
+        })
+        setBatchResults(res.results)
+        if (res.results.length > 0) {
+          setSelectedBatch(0)
+          setResult({
+            success: true,
+            continuation: res.results[0].continuation,
+            latency_ms: res.results[0].latency_ms,
+            stats: {
+              prefix_length: prefix.length,
+              continuation_length: res.results[0].continuation.length,
+              total_length: prefix.length + res.results[0].continuation.length,
+            },
+          })
+        }
+      } else {
+        const res = await api.runInference({
+          prefix, target, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
+        })
+        setResult(res)
+        setBatchResults([])
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Inference failed')
     } finally { setLoading(false) }
-  }, [prefix, target, radius, progressCenter, seed])
+  }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN])
+
+  // Space = run inference keyboard shortcut
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+      if (e.code === 'Space' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault()
+        if (!loading && !prefixError) runInference()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [loading, prefixError, runInference])
 
   const sendToMakcu = useCallback(async () => {
     if (!result?.continuation) return
     setSending(true); setSendProgress(null)
     try {
       await api.serial.sendReports(result.continuation as [number, number][], intervalMs)
-    } catch (e) {
+    } catch {
       setSending(false)
     }
   }, [result, intervalMs])
 
+  const exportCSV = useCallback(() => {
+    if (!result) return
+    const rows = ['dx,dy', ...result.continuation.map(([dx, dy]) => `${dx},${dy}`)].join('\n')
+    const blob = new Blob([rows], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `abcurves_movement_${Date.now()}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [result])
+
+  const exportJSON = useCallback(() => {
+    if (!result) return
+    const data = {
+      continuation: result.continuation,
+      stats: result.stats,
+      latency_ms: result.latency_ms,
+      parameters: { target, radius, progressCenter, seed },
+      exported_at: new Date().toISOString(),
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `abcurves_movement_${Date.now()}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [result, target, radius, progressCenter, seed])
+
+  const selectBatchResult = (idx: number) => {
+    const r = batchResults[idx]
+    if (!r) return
+    setSelectedBatch(idx)
+    setResult({
+      success: true,
+      continuation: r.continuation,
+      latency_ms: r.latency_ms,
+      stats: {
+        prefix_length: prefix.length,
+        continuation_length: r.continuation.length,
+        total_length: prefix.length + r.continuation.length,
+      },
+    })
+  }
+
   const connected = serialStatus?.connected ?? false
+  const activeContinuation = result?.continuation ?? []
 
   return (
     <div className="page animate-in">
-      <h1 className="page-title">Inference</h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+        <h1 className="page-title">Inference</h1>
+        <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.3)', fontFamily: 'JetBrains Mono' }}>
+          Space = Run · R = Replay
+        </div>
+      </div>
       <p className="page-subtitle">Generate realistic mouse movement continuations from a recorded prefix</p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '290px 1fr', gap: 20 }}>
@@ -167,10 +265,35 @@ export default function Inference() {
                 {progressCenter.toFixed(2)}
               </span>
             </InputRow>
-            <InputRow label="Random Seed">
-              <input type="number" className="form-input" style={{ width: '100%' }} value={seed}
-                onChange={e => setSeed(Number(e.target.value))} />
-            </InputRow>
+
+            {/* Seed with lock toggle */}
+            <div className="form-group">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                <label className="form-label" style={{ marginBottom: 0 }}>Random Seed</label>
+                <button
+                  onClick={() => setSeedLocked(v => !v)}
+                  title={seedLocked ? 'Seed is locked — click to randomize each run' : 'Seed is random — click to lock'}
+                  style={{
+                    cursor: 'pointer', padding: '2px 6px',
+                    borderRadius: 4, display: 'flex', alignItems: 'center', gap: 4,
+                    fontSize: 10, color: seedLocked ? '#00d4ff' : 'rgba(126,200,227,0.4)',
+                    background: seedLocked ? 'rgba(0,212,255,0.08)' : 'rgba(0,212,255,0.03)',
+                    border: `1px solid ${seedLocked ? 'rgba(0,212,255,0.2)' : 'rgba(0,212,255,0.07)'}`,
+                  } as React.CSSProperties}
+                >
+                  {seedLocked ? <Lock size={11} /> : <Unlock size={11} />}
+                  {seedLocked ? 'locked' : 'random'}
+                </button>
+              </div>
+              <input type="number" className="form-input" style={{ width: '100%', opacity: seedLocked ? 1 : 0.5 }}
+                value={seed} onChange={e => setSeed(Number(e.target.value))}
+                disabled={!seedLocked} />
+              {!seedLocked && (
+                <span style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)' }}>
+                  Seed will be randomized each run
+                </span>
+              )}
+            </div>
           </div>
 
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
@@ -202,13 +325,61 @@ export default function Inference() {
             </button>
           </div>
 
+          {/* Batch mode toggle */}
+          <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: '12px 16px' }}>
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Layers size={13} color="rgba(0,212,255,0.6)" />
+                <div>
+                  <div style={{ fontSize: 12, color: 'rgba(0,212,255,0.7)', fontWeight: 600 }}>Batch Mode</div>
+                  <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.3)' }}>Generate N variations, pick best</div>
+                </div>
+              </div>
+              <button
+                onClick={() => setBatchMode(v => !v)}
+                style={{
+                  width: 44, height: 24, borderRadius: 12,
+                  background: batchMode ? 'rgba(180,74,255,0.25)' : 'rgba(0,212,255,0.08)',
+                  border: `1px solid ${batchMode ? 'rgba(180,74,255,0.4)' : 'rgba(0,212,255,0.15)'}`,
+                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s ease',
+                  boxShadow: batchMode ? '0 0 8px rgba(180,74,255,0.2)' : 'none',
+                }}
+              >
+                <div style={{
+                  width: 16, height: 16, borderRadius: '50%',
+                  background: batchMode ? '#b44aff' : 'rgba(126,200,227,0.3)',
+                  position: 'absolute', top: 3,
+                  left: batchMode ? 24 : 4,
+                  transition: 'all 0.2s ease',
+                  boxShadow: batchMode ? '0 0 6px #b44aff' : 'none',
+                }} />
+              </button>
+            </div>
+            {batchMode && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <label className="form-label" style={{ marginBottom: 0 }}>Count</label>
+                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#b44aff', fontWeight: 700 }}>{batchN}</span>
+                </div>
+                <input type="range" min={2} max={10} step={1}
+                  value={batchN} onChange={e => setBatchN(Number(e.target.value))}
+                  style={{ width: '100%', accentColor: '#b44aff' }} />
+              </div>
+            )}
+          </div>
+
           {/* Run inference */}
           <button className="btn btn-primary"
             style={{ justifyContent: 'center', padding: '13px', fontSize: 13 }}
             onClick={runInference} disabled={loading || !!prefixError}>
             {loading
-              ? <><span className="spinner" style={{ width: 15, height: 15 }} /> Running Inference…</>
-              : '▶  Run Inference'}
+              ? <><span className="spinner" style={{ width: 15, height: 15 }} />
+                  {batchMode ? ` Running ${batchN} inferences…` : ' Running Inference…'}</>
+              : batchMode
+                ? `▶  Run ${batchN} Batch Inferences`
+                : '▶  Run Inference'}
           </button>
 
           {error && (
@@ -227,7 +398,6 @@ export default function Inference() {
           }}>
             <div className="section-header"><Usb size={13} /> MAKCU Output</div>
 
-            {/* Status chip */}
             <div style={{
               display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14,
               padding: '8px 12px', borderRadius: 6,
@@ -255,7 +425,6 @@ export default function Inference() {
                 onChange={e => setIntervalMs(Number(e.target.value))} />
             </InputRow>
 
-            {/* Progress bar when sending */}
             {sendProgress && (
               <div style={{ marginBottom: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11,
@@ -292,26 +461,77 @@ export default function Inference() {
         {/* ── Canvas + results ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: 16 }}>
-            <div className="section-header">Movement Visualization</div>
+            <div className="section-header" style={{ marginBottom: 10 }}>
+              Movement Visualization
+              <span style={{ marginLeft: 8, fontSize: 10, color: 'rgba(255,45,120,0.4)', fontFamily: 'JetBrains Mono' }}>
+                Click to set target
+              </span>
+            </div>
             <MovementCanvas
               prefix={prefix}
-              continuation={result?.continuation ?? []}
+              continuation={activeContinuation}
               target={target}
               targetRadius={radius}
               width={620}
               height={380}
+              onTargetClick={(x, y) => setTarget([x, y])}
             />
           </div>
 
+          {/* Batch results picker */}
+          {batchResults.length > 1 && (
+            <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+              <div className="section-header"><Layers size={13} /> Batch Results — pick best</div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {batchResults.map((r, i) => (
+                  <button
+                    key={i}
+                    onClick={() => selectBatchResult(i)}
+                    style={{
+                      padding: '8px 14px', borderRadius: 8, cursor: 'pointer',
+                      background: selectedBatch === i ? 'rgba(180,74,255,0.12)' : 'rgba(0,212,255,0.04)',
+                      border: `1px solid ${selectedBatch === i ? 'rgba(180,74,255,0.4)' : 'rgba(0,212,255,0.1)'}`,
+                      color: selectedBatch === i ? '#b44aff' : 'rgba(126,200,227,0.6)',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 2 }}>#{i + 1}</div>
+                    <div style={{ fontSize: 10, fontFamily: 'JetBrains Mono', color: 'rgba(126,200,227,0.5)' }}>
+                      {r.length} pts · {r.latency_ms.toFixed(0)}ms
+                    </div>
+                    <div style={{ fontSize: 9, color: 'rgba(126,200,227,0.3)', marginTop: 2 }}>
+                      seed {r.seed}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {result && (
             <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
-              <div className="section-header">Inference Results</div>
+              <div className="section-header" style={{ marginBottom: 12 }}>
+                Inference Results
+                {/* Export buttons */}
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                  <button className="btn btn-secondary"
+                    style={{ padding: '4px 10px', fontSize: 11 }}
+                    onClick={exportCSV} title="Export as CSV">
+                    <Download size={12} /> CSV
+                  </button>
+                  <button className="btn btn-secondary"
+                    style={{ padding: '4px 10px', fontSize: 11 }}
+                    onClick={exportJSON} title="Export as JSON">
+                    <Download size={12} /> JSON
+                  </button>
+                </div>
+              </div>
               <div className="grid-3" style={{ gap: 12 }}>
                 {[
-                  ['Prefix Length',        result.stats.prefix_length],
-                  ['Continuation Points',  result.stats.continuation_length],
-                  ['Total Reports',        result.stats.total_length],
-                ].map(([label, value]) => (
+                  ['Prefix Length',        result.stats.prefix_length,        '#00d4ff'],
+                  ['Continuation Points',  result.stats.continuation_length,  '#39ff14'],
+                  ['Total Reports',        result.stats.total_length,         '#b44aff'],
+                ].map(([label, value, color]) => (
                   <div key={label as string} style={{
                     background: 'rgba(0,212,255,0.04)', borderRadius: 8,
                     padding: '12px 16px', border: '1px solid rgba(0,212,255,0.1)',
@@ -320,13 +540,29 @@ export default function Inference() {
                       textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 6 }}>
                       {label}
                     </div>
-                    <div style={{ fontSize: 22, fontWeight: 700, color: '#00d4ff',
-                      fontFamily: 'JetBrains Mono', textShadow: '0 0 10px rgba(0,212,255,0.3)' }}>
+                    <div style={{ fontSize: 22, fontWeight: 700, color: color as string,
+                      fontFamily: 'JetBrains Mono', textShadow: `0 0 10px ${color as string}88` }}>
                       {value}
                     </div>
                   </div>
                 ))}
               </div>
+
+              {result.latency_ms !== undefined && (
+                <div style={{
+                  marginTop: 12, padding: '8px 14px', borderRadius: 6,
+                  background: 'rgba(255,140,0,0.05)', border: '1px solid rgba(255,140,0,0.12)',
+                  display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+                }}>
+                  <span style={{ color: 'rgba(126,200,227,0.4)', fontSize: 11 }}>Inference latency</span>
+                  <span style={{ color: '#ff8c00', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
+                    {result.latency_ms.toFixed(1)} ms
+                  </span>
+                  <span style={{ color: 'rgba(57,255,20,0.5)', marginLeft: 'auto', fontSize: 11 }}>
+                    🛡 0/1280 caught in cold tests
+                  </span>
+                </div>
+              )}
 
               <div style={{ marginTop: 16 }}>
                 <div className="section-header">Generated Trajectory (first 16 deltas)</div>
@@ -363,7 +599,11 @@ export default function Inference() {
               </div>
               <div style={{ fontSize: 12, color: 'rgba(126,200,227,0.3)' }}>
                 Click <b style={{ color: '#00d4ff' }}>Run Inference</b> to generate a realistic B→C movement,
-                then <b style={{ color: '#39ff14' }}>Send to MAKCU</b> to inject it as real mouse input.
+                or press <b style={{ color: '#00d4ff' }}>Space</b>. Then{' '}
+                <b style={{ color: '#39ff14' }}>Send to MAKCU</b> to inject it as real mouse input.
+              </div>
+              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.2)', marginTop: 12 }}>
+                Click on the canvas above to set the target position visually
               </div>
             </div>
           )}

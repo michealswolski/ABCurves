@@ -84,6 +84,7 @@ class SerialManager:
         self._protocol: str = "text"
         self._port_name: str = ""
         self._baud: int = 115200
+        self._macro_events: list[dict] = []
 
     # ── port enumeration ──────────────────────────────────────────────────────
 
@@ -221,6 +222,53 @@ class SerialManager:
 
     def reset_stats(self) -> None:
         self._stats = SerialStats()
+
+    # ── reconnect ─────────────────────────────────────────────────────────────
+
+    def reconnect(self) -> dict:
+        """Re-connect using the last known port, baud rate, and protocol."""
+        if not self._port_name:
+            return {"ok": False, "error": "No previous connection — connect manually first"}
+        return self.connect(self._port_name, self._baud, self._protocol)
+
+    # ── macro replay ──────────────────────────────────────────────────────────
+
+    def replay_macro_events(self, events: list[dict], on_progress=None) -> dict:
+        """Replay a sequence of macro events through the connected port.
+
+        Event shapes:
+          {"type": "move",  "dx": int, "dy": int}
+          {"type": "click", "button": "left"|"right"|"middle"}
+          {"type": "pause", "ms": float}
+        """
+        if not self.is_connected:
+            return {"ok": False, "error": "Not connected"}
+        encoder = PROTOCOLS.get(self._protocol, _text_packet)
+        errors = 0
+        total = len(events)
+        for i, ev in enumerate(events):
+            etype = ev.get("type", "")
+            try:
+                if etype == "move":
+                    pkt = encoder(int(ev.get("dx", 0)), int(ev.get("dy", 0)))
+                    with self._lock:
+                        self._port.write(pkt)
+                        self._stats.bytes_sent += len(pkt)
+                        self._stats.reports_sent += 1
+                elif etype == "click":
+                    cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
+                    cmd = cmd_map.get(ev.get("button", "left"), "CL\n").encode()
+                    with self._lock:
+                        self._port.write(cmd)
+                elif etype == "pause":
+                    time.sleep(float(ev.get("ms", 50)) / 1000.0)
+            except serial.SerialException as exc:
+                logger.warning("Macro replay error at event %d: %s", i, exc)
+                self._stats.errors += 1
+                errors += 1
+            if on_progress:
+                on_progress(i + 1, total)
+        return {"ok": errors == 0, "errors": errors, "events_replayed": total}
 
 
 # ── helper ────────────────────────────────────────────────────────────────────

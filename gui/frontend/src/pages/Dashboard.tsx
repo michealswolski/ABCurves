@@ -1,18 +1,39 @@
 import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import StatCard from '../components/StatCard'
-import { Activity, Cpu, Zap, Shield, MousePointer2, BarChart2, Brain } from 'lucide-react'
-import { api } from '../services/api'
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+} from 'recharts'
+import { Activity, Cpu, Zap, Shield, MousePointer2, BarChart2, Brain, Database } from 'lucide-react'
+import { api, LatencyEntry, ModelInfo } from '../services/api'
 
 export default function Dashboard() {
   const navigate = useNavigate()
   const [serverOnline, setServerOnline] = useState<boolean | null>(null)
+  const [latencies, setLatencies] = useState<LatencyEntry[]>([])
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
 
   useEffect(() => {
     api.health()
       .then(() => setServerOnline(true))
       .catch(() => setServerOnline(false))
+
+    api.modelsInfo()
+      .then(info => setModelInfo(info))
+      .catch(() => {})
+
+    // Poll latency history every 5 s
+    const fetchLatency = () =>
+      api.latencyHistory(20).then(d => setLatencies(d.history)).catch(() => {})
+    fetchLatency()
+    const t = setInterval(fetchLatency, 5000)
+    return () => clearInterval(t)
   }, [])
+
+  const chartData = latencies.map((e, i) => ({
+    i: i + 1,
+    ms: e.ms,
+  }))
 
   return (
     <div className="page animate-in">
@@ -100,17 +121,19 @@ export default function Dashboard() {
           trend={{ direction: 'down', label: 'Human avg: 0.639' }}
         />
         <StatCard
-          title="P50 Latency"
-          value="0.24ms"
-          subtitle="Profile path, warmed"
+          title={latencies.length > 0 ? `Last: ${latencies[latencies.length - 1].ms}ms` : 'P50 Latency'}
+          value={latencies.length > 0
+            ? `${(latencies.reduce((s, e) => s + e.ms, 0) / latencies.length).toFixed(0)}ms`
+            : '0.24ms'}
+          subtitle={latencies.length > 0 ? `avg over ${latencies.length} runs` : 'Profile path, warmed'}
           icon={<Zap size={20} />}
           accent="#ff8c00"
-          trend={{ direction: 'neutral', label: 'p99: 0.43ms' }}
+          trend={{ direction: 'neutral', label: latencies.length > 0 ? `last: ${latencies[latencies.length - 1].ms}ms` : 'p99: 0.43ms' }}
         />
       </div>
 
       {/* Main grid */}
-      <div className="grid-2">
+      <div className="grid-2" style={{ marginBottom: 20 }}>
         {/* Pipeline diagram */}
         <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
           <div className="section-header">A → B → C Pipeline</div>
@@ -135,41 +158,29 @@ export default function Dashboard() {
                 <stop offset="100%" stopColor="#b44aff"/>
               </linearGradient>
             </defs>
-
-            {/* Node A */}
             <rect x="10" y="55" width="110" height="90" rx="10"
               fill="rgba(0,212,255,0.06)" stroke="#00d4ff" strokeWidth="1.2"/>
             <text x="65" y="93" textAnchor="middle" fill="#00d4ff" fontSize="28" fontWeight="800" filter="url(#glow-blue)">A</text>
             <text x="65" y="112" textAnchor="middle" fill="rgba(0,212,255,0.7)" fontSize="10" fontWeight="600">Start Point</text>
             <text x="65" y="127" textAnchor="middle" fill="rgba(0,212,255,0.4)" fontSize="9">Human prefix dx/dy</text>
-
-            {/* Arrow A→B */}
             <line x1="124" y1="100" x2="180" y2="100"
               stroke="url(#lineGrad)" strokeWidth="2"
               markerEnd="url(#arr-blue)" strokeDasharray="6,4"/>
             <text x="153" y="90" textAnchor="middle" fill="rgba(0,212,255,0.5)" fontSize="9">Planner reads</text>
-
-            {/* Node B */}
             <rect x="184" y="55" width="110" height="90" rx="10"
               fill="rgba(180,74,255,0.06)" stroke="#b44aff" strokeWidth="1.2"/>
             <text x="239" y="93" textAnchor="middle" fill="#b44aff" fontSize="28" fontWeight="800" filter="url(#glow-purple)">B</text>
             <text x="239" y="112" textAnchor="middle" fill="rgba(180,74,255,0.8)" fontSize="10" fontWeight="600">Waypoint</text>
             <text x="239" y="127" textAnchor="middle" fill="rgba(180,74,255,0.5)" fontSize="9">Cut &amp; plan here</text>
-
-            {/* Arrow B→C */}
             <line x1="298" y1="100" x2="354" y2="100"
               stroke="#b44aff" strokeWidth="2"
               markerEnd="url(#arr-purple)" strokeDasharray="6,4"/>
             <text x="327" y="90" textAnchor="middle" fill="rgba(180,74,255,0.5)" fontSize="9">Renderer emits</text>
-
-            {/* Node C */}
             <rect x="358" y="55" width="110" height="90" rx="10"
               fill="rgba(57,255,20,0.05)" stroke="#39ff14" strokeWidth="1.2"/>
             <text x="413" y="93" textAnchor="middle" fill="#39ff14" fontSize="28" fontWeight="800">C</text>
             <text x="413" y="112" textAnchor="middle" fill="rgba(57,255,20,0.8)" fontSize="10" fontWeight="600">Target</text>
             <text x="413" y="127" textAnchor="middle" fill="rgba(57,255,20,0.5)" fontSize="9">Generated 1kHz output</text>
-
-            {/* Bottom label */}
             <text x="240" y="178" textAnchor="middle" fill="rgba(126,200,227,0.3)" fontSize="10">
               16 ProDMP heads · GRU Renderer · delta-sigma accumulator
             </text>
@@ -235,6 +246,127 @@ export default function Dashboard() {
               ))}
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Latency chart + Model info row */}
+      <div className="grid-2">
+        {/* Live latency chart */}
+        <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+          <div className="section-header">
+            <Zap size={13} />
+            Inference Latency
+            {latencies.length > 0 && (
+              <span style={{ marginLeft: 'auto', fontSize: 11, color: 'rgba(0,212,255,0.4)',
+                fontFamily: 'JetBrains Mono' }}>
+                {latencies.length} runs
+              </span>
+            )}
+          </div>
+          {chartData.length === 0 ? (
+            <div style={{
+              height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: 'rgba(126,200,227,0.25)', fontSize: 12, flexDirection: 'column', gap: 8,
+            }}>
+              <Zap size={28} color="rgba(0,212,255,0.15)" />
+              Run inference to see latency data
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={160}>
+              <LineChart data={chartData} margin={{ top: 5, right: 10, bottom: 5, left: -10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,212,255,0.06)" />
+                <XAxis dataKey="i" tick={{ fill: 'rgba(126,200,227,0.3)', fontSize: 10 }}
+                  label={{ value: 'run', position: 'insideBottom', offset: -2,
+                    fill: 'rgba(126,200,227,0.2)', fontSize: 9 }} />
+                <YAxis tick={{ fill: 'rgba(126,200,227,0.3)', fontSize: 10 }}
+                  unit="ms" width={45} />
+                <Tooltip
+                  contentStyle={{
+                    background: 'rgba(3,3,20,0.97)', border: '1px solid rgba(0,212,255,0.2)',
+                    borderRadius: 6, fontSize: 11,
+                  }}
+                  labelStyle={{ color: 'rgba(0,212,255,0.6)' }}
+                  itemStyle={{ color: '#ff8c00' }}
+                  formatter={(v: number) => [`${v} ms`, 'Latency']}
+                  labelFormatter={(l: number) => `Run #${l}`}
+                />
+                <Line type="monotone" dataKey="ms" stroke="#ff8c00"
+                  strokeWidth={2} dot={false}
+                  activeDot={{ r: 4, fill: '#ff8c00', stroke: 'rgba(255,140,0,0.3)', strokeWidth: 6 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+          {latencies.length > 1 && (() => {
+            const vals = latencies.map(e => e.ms)
+            const avg = vals.reduce((a, b) => a + b, 0) / vals.length
+            const min = Math.min(...vals)
+            const max = Math.max(...vals)
+            return (
+              <div style={{ display: 'flex', gap: 16, marginTop: 8, justifyContent: 'center' }}>
+                {[['Min', min, '#39ff14'], ['Avg', avg, '#ff8c00'], ['Max', max, '#ff2d78']].map(([l, v, c]) => (
+                  <div key={l as string} style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, fontFamily: 'JetBrains Mono', color: c as string }}>
+                      {(v as number).toFixed(0)}ms
+                    </div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{l}</div>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
+        </div>
+
+        {/* Model info card */}
+        <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+          <div className="section-header"><Database size={13} /> Loaded Models</div>
+          {!modelInfo ? (
+            <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              color: 'rgba(126,200,227,0.25)', fontSize: 12 }}>
+              Loading…
+            </div>
+          ) : modelInfo.models.length === 0 ? (
+            <div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              flexDirection: 'column', gap: 8, color: 'rgba(255,140,0,0.5)', fontSize: 12 }}>
+              <Database size={28} color="rgba(255,140,0,0.15)" />
+              No model files found in /models
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+              {modelInfo.models.map(m => (
+                <div key={m.name} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '9px 0', borderBottom: '1px solid rgba(0,212,255,0.06)',
+                }}>
+                  <div>
+                    <div style={{ fontSize: 12, color: '#00d4ff', fontFamily: 'JetBrains Mono', fontWeight: 600 }}>
+                      {m.name}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', marginTop: 2 }}>
+                      {m.ext === '.pt' ? 'PyTorch model' : 'Binary model'}
+                    </div>
+                  </div>
+                  <div style={{
+                    fontSize: 11, fontFamily: 'JetBrains Mono', fontWeight: 700,
+                    color: m.size_mb > 50 ? '#b44aff' : m.size_mb > 10 ? '#ff8c00' : '#39ff14',
+                  }}>
+                    {m.size_mb.toFixed(1)} MB
+                  </div>
+                </div>
+              ))}
+              <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 6,
+                background: modelInfo.pipeline_ready ? 'rgba(57,255,20,0.05)' : 'rgba(255,140,0,0.05)',
+                border: `1px solid ${modelInfo.pipeline_ready ? 'rgba(57,255,20,0.15)' : 'rgba(255,140,0,0.15)'}`,
+                display: 'flex', alignItems: 'center', gap: 8, fontSize: 11,
+                color: modelInfo.pipeline_ready ? '#39ff14' : '#ff8c00',
+              }}>
+                <div style={{ width: 6, height: 6, borderRadius: '50%',
+                  background: modelInfo.pipeline_ready ? '#39ff14' : '#ff8c00',
+                  boxShadow: modelInfo.pipeline_ready ? '0 0 6px #39ff14' : undefined,
+                }} />
+                {modelInfo.pipeline_ready ? 'Pipeline loaded and ready' : 'Pipeline not loaded'}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

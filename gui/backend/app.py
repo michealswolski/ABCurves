@@ -1,6 +1,7 @@
 """ABCurves Flask backend — includes MAKCU serial port integration."""
 
 import json
+import time
 import threading
 import numpy as np
 from pathlib import Path
@@ -24,6 +25,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 serial_mgr = SerialManager()
 pipeline = None
 inference_history: list[dict] = []
+latency_history: list[dict] = []   # rolling last 100 inference latencies
 training_logs: list[dict] = []
 
 
@@ -88,6 +90,7 @@ def run_inference():
         prog_center   = float(data.get('progress_center', 0.72))
         seed          = int(data.get('seed', 2026))
 
+        t0 = time.time()
         with Pipeline.from_pretrained() as pipe:
             renderer_profile = None
             if data.get('profile'):
@@ -102,21 +105,27 @@ def run_inference():
                 progress_center=prog_center,
                 seed=seed,
             )
+        latency_ms = round((time.time() - t0) * 1000, 2)
 
-        result = {
+        entry = {
             'timestamp':           datetime.now().isoformat(),
             'prefix_length':       len(prefix),
             'continuation_length': len(counts),
             'continuation':        counts.tolist(),
+            'latency_ms':          latency_ms,
             'parameters': {
                 'target': list(target_rel), 'target_radius': target_radius,
                 'progress_center': prog_center, 'seed': seed,
             },
         }
-        inference_history.append(result)
+        inference_history.append(entry)
+        latency_history.append({'t': entry['timestamp'], 'ms': latency_ms})
+        if len(latency_history) > 100:
+            latency_history.pop(0)
         return jsonify({
             'success': True,
             'continuation': counts.tolist(),
+            'latency_ms': latency_ms,
             'stats': {
                 'prefix_length':       len(prefix),
                 'continuation_length': len(counts),
@@ -133,6 +142,70 @@ def run_inference():
 def get_inference_history():
     limit = request.args.get('limit', 10, type=int)
     return jsonify({'count': len(inference_history), 'history': inference_history[-limit:]})
+
+
+@app.route('/api/inference/latency-history')
+def inference_latency_history():
+    limit = request.args.get('limit', 50, type=int)
+    return jsonify({'history': latency_history[-limit:]})
+
+
+@app.route('/api/inference/batch', methods=['POST'])
+def run_inference_batch():
+    """Run N inferences with different seeds; return all continuations."""
+    try:
+        data = request.json or {}
+        n = min(max(int(data.get('n', 3)), 1), 10)
+        if not data.get('prefix'):
+            return jsonify({'error': 'No prefix data provided'}), 400
+
+        prefix = np.array(data['prefix'], dtype=np.float32)
+        target_rel    = tuple(data.get('target', [100, 0]))
+        target_radius = float(data.get('target_radius', 18.0))
+        prog_center   = float(data.get('progress_center', 0.72))
+        base_seed     = int(data.get('seed', 2026))
+
+        results = []
+        with Pipeline.from_pretrained() as pipe:
+            for i in range(n):
+                t0 = time.time()
+                counts = pipe.generate(
+                    prefix,
+                    target_rel_at_B=target_rel,
+                    target_radius=target_radius,
+                    progress_center=prog_center,
+                    seed=base_seed + i,
+                )
+                results.append({
+                    'index':        i,
+                    'seed':         base_seed + i,
+                    'latency_ms':   round((time.time() - t0) * 1000, 2),
+                    'continuation': counts.tolist(),
+                    'length':       len(counts),
+                })
+        return jsonify({'success': True, 'n': n, 'results': results})
+    except Exception as exc:
+        logger.error("Batch inference error: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/models/info')
+def models_info():
+    """Return loaded model files with sizes."""
+    model_dir = Path(__file__).parent.parent.parent / 'models'
+    models = []
+    try:
+        for pat in ('*.pt', '*.bin'):
+            for f in sorted(model_dir.glob(pat)):
+                size_mb = f.stat().st_size / 1024 / 1024
+                models.append({'name': f.name, 'size_mb': round(size_mb, 2), 'ext': f.suffix})
+    except FileNotFoundError:
+        pass
+    return jsonify({
+        'models':        models,
+        'count':         len(models),
+        'pipeline_ready': pipeline is not None,
+    })
 
 
 @app.route('/api/example-data')
@@ -237,6 +310,34 @@ def serial_click():
 def serial_reset_stats():
     serial_mgr.reset_stats()
     return jsonify({'ok': True})
+
+
+@app.route('/api/serial/reconnect', methods=['POST'])
+def serial_reconnect():
+    result = serial_mgr.reconnect()
+    if result['ok']:
+        socketio.emit('serial_status', serial_mgr.status)
+    return jsonify(result)
+
+
+@app.route('/api/serial/macro/replay', methods=['POST'])
+def serial_macro_replay():
+    """Replay a sequence of macro events through the connected MAKCU."""
+    if not serial_mgr.is_connected:
+        return jsonify({'ok': False, 'error': 'MAKCU not connected'}), 400
+
+    events = (request.json or {}).get('events', [])
+    if not events:
+        return jsonify({'ok': False, 'error': 'No events provided'}), 400
+
+    def do_replay():
+        def progress(done, total):
+            socketio.emit('macro_progress', {'done': done, 'total': total})
+        result = serial_mgr.replay_macro_events(events, on_progress=progress)
+        socketio.emit('macro_done', result)
+
+    threading.Thread(target=do_replay, daemon=True).start()
+    return jsonify({'ok': True, 'message': 'Macro replay started', 'total': len(events)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
