@@ -181,16 +181,30 @@ export const api = {
   // Vision auto-detection
   detection: {
     start: (opts: {
-      classes: string[]
+      classes?: string[]
+      mode?: 'snap' | 'track' | 'smooth'
       confidence?: number
       cooldown_ms?: number
       fov_config?: { dpi: number; sensitivity: number; fovH: number; screenW: number }
       max_movement_ms?: number
       interval_ms?: number
       aim_height?: number
-    }) => post<{ ok: boolean; classes?: string[]; error?: string }>('/detection/start', opts),
+      lead_ms?: number
+      rcs_strength?: number
+      target_radius?: number
+      progress_center?: number
+    }) => post<{ ok: boolean; classes?: string[]; mode?: string; error?: string }>('/detection/start', opts),
     stop:   () => post<{ ok: boolean }>('/detection/stop'),
-    status: () => get<{ running: boolean; fps: number; hits: number; last_px: [number, number] | null }>('/detection/status'),
+    status: () => get<{
+      running: boolean
+      fps: number
+      hits: number
+      last_px: [number, number] | null
+      velocity: [number, number] | null
+      mode: string
+      config: Record<string, number | string>
+    }>('/detection/status'),
+    modes:  () => get<Record<string, { max_movement_ms: number; cooldown_ms: number; aim_height: number; desc: string }>>('/detection/modes'),
   },
 
   // Results

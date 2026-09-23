@@ -258,17 +258,74 @@ def push_target():
     return jsonify({'ok': True, 'counts': [cx, cy]})
 
 
+# ── AIM MODE PRESETS ─────────────────────────────────────────────────────────
+#
+#  snap   — hard instant snap, short burst, 40ms travel, very tight radius
+#  track  — continuous follow, velocity-predicted, 80ms travel, medium radius
+#  smooth — gradual human-looking arc, 160ms travel, relaxed radius
+#
+AIM_MODES: dict[str, dict] = {
+    'snap': {
+        'max_movement_ms': 40,
+        'interval_ms':     0.5,
+        'cooldown_ms':     80,
+        'target_radius':   4,
+        'progress_center': 0.25,   # front-loaded curve → arrives early
+        'aim_height':      0.10,   # head level
+        'desc':            'Instant hard snap — fastest, most mechanical',
+    },
+    'track': {
+        'max_movement_ms': 80,
+        'interval_ms':     1.0,
+        'cooldown_ms':     150,
+        'target_radius':   8,
+        'progress_center': 0.40,
+        'aim_height':      0.12,
+        'desc':            'Continuous tracking with velocity prediction',
+    },
+    'smooth': {
+        'max_movement_ms': 160,
+        'interval_ms':     2.0,
+        'cooldown_ms':     350,
+        'target_radius':   14,
+        'progress_center': 0.55,   # symmetric, natural-looking arc
+        'aim_height':      0.15,   # upper chest
+        'desc':            'Gradual human-like arc — least mechanical',
+    },
+}
+
 # ── Vision auto-detection ─────────────────────────────────────────────────────
 _det_state: dict = {
-    'running': False, 'fps': 0.0, 'hits': 0, 'last_px': None, 'thread': None, 'classes': [], 'last_error': None,
+    'running':    False,
+    'fps':        0.0,
+    'hits':       0,
+    'last_px':    None,
+    'thread':     None,
+    'classes':    [],
+    'last_error': None,
+    'velocity':   None,   # [vx_px_per_s, vy_px_per_s]
+    'mode':       'track',
+    'config':     {},
 }
 _det_lock = threading.Lock()
 
 
-def _run_detection(classes: list, confidence: float, cooldown_ms: float,
-                   fov_config: dict | None, max_movement_ms: float,
-                   interval_ms: float, aim_height: float):
-    # ── imports ────────────────────────────────────────────────────────────────
+def _run_detection(
+    classes: list,
+    confidence: float,
+    cooldown_ms: float,
+    fov_config: dict | None,
+    max_movement_ms: float,
+    interval_ms: float,
+    aim_height: float,
+    mode: str,
+    lead_ms: float,
+    rcs_strength: float,
+    target_radius: float,
+    progress_center: float,
+):
+    from collections import deque
+
     try:
         import torch
         from ultralytics import YOLOWorld
@@ -280,12 +337,10 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
             _det_state['last_error'] = msg
         return
 
-    # ── device: prefer CUDA, fall back to CPU ──────────────────────────────────
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device   = 'cuda' if torch.cuda.is_available() else 'cpu'
     use_fp16 = device == 'cuda'
-    logger.info("Detection device: %s%s", device.upper(), " (FP16)" if use_fp16 else "")
+    logger.info("Detection device: %s%s  mode=%s", device.upper(), " (FP16)" if use_fp16 else "", mode)
 
-    # ── load model ─────────────────────────────────────────────────────────────
     logger.info("Loading YOLO-World…")
     try:
         model = YOLOWorld('yolov8s-worldv2.pt')
@@ -301,8 +356,7 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
             _det_state['last_error'] = msg
         return
 
-    # ── GPU warmup (prevents first-frame spike) ────────────────────────────────
-    logger.info("YOLO-World ready for: %s — warming up…", classes)
+    logger.info("YOLO-World ready — classes=%s  mode=%s — warming up…", classes, mode)
     try:
         dummy = np.zeros((640, 640, 3), dtype=np.uint8)
         with torch.no_grad():
@@ -314,16 +368,13 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
     except Exception as exc:
         logger.warning("Warmup failed (non-fatal): %s", exc)
 
-    # ── screen capture: dxcam (DirectX, fast) → mss fallback ──────────────────
     try:
         import dxcam
         _use_dxcam = True
     except ImportError:
-        import mss as _mss_mod
         _use_dxcam = False
     logger.info("Screen capture: %s", "dxcam (DirectX)" if _use_dxcam else "mss (fallback)")
 
-    # ── renderer profile ───────────────────────────────────────────────────────
     renderer_profile = None
     if pipeline is not None:
         try:
@@ -333,7 +384,6 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
         except Exception as exc:
             logger.warning("Renderer profile prep failed: %s", exc)
 
-    # ── FOV → counts-per-pixel ─────────────────────────────────────────────────
     if fov_config:
         dpi  = float(fov_config.get('dpi', 400))
         sens = float(fov_config.get('sensitivity', 3.2554))
@@ -343,22 +393,113 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
         dpi, sens, fovH, sw = 400.0, 3.2554, 106.26, 2560.0
     cpp = (dpi / 400) / (sens * 0.022) * (fovH / sw)
 
-    max_reps = math.ceil(max_movement_ms / max(interval_ms, 0.5))
-    last_fire = 0.0
-    frame_ts: list = []
-    crop = 640
+    max_reps     = math.ceil(max_movement_ms / max(interval_ms, 0.5))
+    last_fire    = 0.0
+    frame_ts:    list  = []
+    pos_history: deque = deque(maxlen=8)   # (time, px_x, px_y)
+    crop         = 640
 
+    # ── inner frame processor — shared by dxcam + mss paths ───────────────────
+    def process_frame(frame: np.ndarray, cx_rel: int, cy_rel: int) -> None:
+        nonlocal last_fire
+        import torch as _torch
+
+        with _torch.no_grad():
+            results = model(frame, conf=confidence, iou=0.4, verbose=False)[0]
+
+        boxes     = results.boxes
+        best_px, best_dist = None, float('inf')
+        if boxes is not None and len(boxes):
+            for box in boxes.xyxy.cpu().numpy():
+                bx   = (box[0] + box[2]) / 2
+                by   = box[1] + (box[3] - box[1]) * aim_height
+                dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
+
+        now = time.time()
+
+        if best_px:
+            px_x, px_y = best_px
+
+            # velocity tracking: weighted average of last 3 deltas (newest = highest weight)
+            pos_history.append((now, px_x, px_y))
+            vx = vy = 0.0
+            n = len(pos_history)
+            if n >= 3:
+                w_vx, w_vy, total_w = 0.0, 0.0, 0.0
+                for i in range(n - 1, max(n - 4, 0), -1):
+                    dt = pos_history[i][0] - pos_history[i - 1][0]
+                    if dt > 0.001:
+                        w     = 2.0 ** (n - 1 - i)
+                        w_vx += (pos_history[i][1] - pos_history[i - 1][1]) / dt * w
+                        w_vy += (pos_history[i][2] - pos_history[i - 1][2]) / dt * w
+                        total_w += w
+                if total_w > 0:
+                    vx, vy = w_vx / total_w, w_vy / total_w
+
+            # target lead: project aim forward by lead_ms only when target is actually moving
+            if lead_ms > 0 and (abs(vx) > 8 or abs(vy) > 8):
+                px_x += vx * (lead_ms / 1000.0)
+                px_y += vy * (lead_ms / 1000.0)
+
+            with _det_lock:
+                _det_state['last_px']  = [round(px_x, 1), round(px_y, 1)]
+                _det_state['velocity'] = [round(vx, 1), round(vy, 1)]
+            socketio.emit('detection_update', {
+                'px_x': px_x, 'px_y': px_y,
+                'dist': round(best_dist, 1),
+                'vx':   round(vx, 1), 'vy': round(vy, 1),
+            })
+
+            if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+                cx_c = round(px_x * cpp)
+                cy_c = round(px_y * cpp)
+                try:
+                    rng2    = np.random.default_rng(int(now * 1000) & 0xFFFF)
+                    prefix  = rng2.standard_normal((20, 2)).astype(np.float32) * 2
+                    reports = pipeline.generate(
+                        prefix,
+                        renderer_profile=renderer_profile,
+                        target_rel_at_B=(cx_c, cy_c),
+                        target_radius=target_radius,
+                        progress_center=progress_center,
+                        seed=int(now * 1000) % 10000,
+                    ).tolist()[:max_reps]
+                    if reports:
+                        serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
+                        last_fire = now
+                        with _det_lock:
+                            _det_state['hits'] += 1
+
+                        # recoil control: push mouse down after movement to counter upward camera kick
+                        # rcs_strength 0-1; ~4 counts per shot at full strength
+                        if rcs_strength > 0:
+                            rcs_counts = round(4.0 * rcs_strength)
+                            if rcs_counts > 0:
+                                _delay = max_movement_ms / 1000.0 * 0.8
+                                def _do_rcs(c=rcs_counts, d=_delay):
+                                    time.sleep(d)
+                                    serial_mgr.send_single(0, c)
+                                threading.Thread(target=_do_rcs, daemon=True).start()
+                except Exception as exc:
+                    logger.debug("Auto-fire error: %s", exc)
+        else:
+            with _det_lock:
+                _det_state['last_px']  = None
+                _det_state['velocity'] = None
+            pos_history.clear()
+
+    # ── capture + inference loop ───────────────────────────────────────────────
     try:
         if _use_dxcam:
-            import ctypes
+            import ctypes, dxcam as _dxcam
             mw = ctypes.windll.user32.GetSystemMetrics(0)
             mh = ctypes.windll.user32.GetSystemMetrics(1)
             region = (mw // 2 - crop // 2, mh // 2 - crop // 2,
                       mw // 2 + crop // 2, mh // 2 + crop // 2)
             cx_rel = cy_rel = crop // 2
-            cam = dxcam.create(output_color="BGR")
-            # Seed with one mss frame so the loop starts even on a static desktop.
-            # In-game the screen always changes and dxcam delivers fresh frames.
+            cam = _dxcam.create(output_color="BGR")
             import mss as _mss_seed
             with _mss_seed.MSS() as _sct:
                 _mon = _sct.monitors[1]
@@ -377,142 +518,58 @@ def _run_detection(classes: list, confidence: float, cooldown_ms: float,
                 grabbed = cam.grab(region=region)
                 if grabbed is not None:
                     last_frame = grabbed
-                frame = last_frame
-
-                with torch.no_grad():
-                    results = model(frame, conf=confidence, verbose=False)[0]
-
-                boxes = results.boxes
-                best_px, best_dist = None, float('inf')
-                if boxes is not None and len(boxes):
-                    for box in boxes.xyxy.cpu().numpy():
-                        bx  = (box[0] + box[2]) / 2
-                        by  = box[1] + (box[3] - box[1]) * aim_height
-                        dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
-                        if dist < best_dist:
-                            best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
-
-                if best_px:
-                    px_x, px_y = best_px
-                    with _det_lock:
-                        _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
-                    socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
-                    now = time.time()
-                    if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
-                        cx_c = round(px_x * cpp)
-                        cy_c = round(px_y * cpp)
-                        try:
-                            rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
-                            prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
-                            reports = pipeline.generate(
-                                prefix,
-                                renderer_profile=renderer_profile,
-                                target_rel_at_B=(cx_c, cy_c),
-                                target_radius=10,
-                                progress_center=0.5,
-                                seed=int(now * 1000) % 10000,
-                            ).tolist()[:max_reps]
-                            if reports:
-                                serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
-                                last_fire = now
-                                with _det_lock:
-                                    _det_state['hits'] += 1
-                        except Exception as exc:
-                            logger.debug("Auto-fire error: %s", exc)
-                else:
-                    with _det_lock:
-                        _det_state['last_px'] = None
+                process_frame(last_frame, cx_rel, cy_rel)
 
                 elapsed = time.time() - t0
                 frame_ts.append(elapsed)
                 if len(frame_ts) > 30:
                     frame_ts.pop(0)
-                fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
                 with _det_lock:
-                    _det_state['fps'] = fps
+                    _det_state['fps'] = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
 
             del cam
         else:
+            import mss as _mss_mod
             with _mss_mod.MSS() as sct:
-                mon = sct.monitors[1]
+                mon  = sct.monitors[1]
                 mw, mh = mon['width'], mon['height']
-                cap = {
+                cap  = {
                     'left':   mon['left'] + mw // 2 - crop // 2,
                     'top':    mon['top']  + mh // 2 - crop // 2,
                     'width':  crop, 'height': crop,
                 }
                 cx_rel = cy_rel = crop // 2
-
                 while True:
                     with _det_lock:
                         if not _det_state['running']:
                             break
                     t0 = time.time()
                     frame = np.array(sct.grab(cap))[:, :, :3]
-
-                    with torch.no_grad():
-                        results = model(frame, conf=confidence, verbose=False)[0]
-
-                    boxes = results.boxes
-                    best_px, best_dist = None, float('inf')
-                    if boxes is not None and len(boxes):
-                        for box in boxes.xyxy.cpu().numpy():
-                            bx  = (box[0] + box[2]) / 2
-                            by  = box[1] + (box[3] - box[1]) * aim_height
-                            dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
-                            if dist < best_dist:
-                                best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
-
-                    if best_px:
-                        px_x, px_y = best_px
-                        with _det_lock:
-                            _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
-                        socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
-                        now = time.time()
-                        if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
-                            cx_c = round(px_x * cpp)
-                            cy_c = round(px_y * cpp)
-                            try:
-                                rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
-                                prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
-                                reports = pipeline.generate(
-                                    prefix,
-                                    renderer_profile=renderer_profile,
-                                    target_rel_at_B=(cx_c, cy_c),
-                                    target_radius=10,
-                                    progress_center=0.5,
-                                    seed=int(now * 1000) % 10000,
-                                ).tolist()[:max_reps]
-                                if reports:
-                                    serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
-                                    last_fire = now
-                                    with _det_lock:
-                                        _det_state['hits'] += 1
-                            except Exception as exc:
-                                logger.debug("Auto-fire error: %s", exc)
-                    else:
-                        with _det_lock:
-                            _det_state['last_px'] = None
+                    process_frame(frame, cx_rel, cy_rel)
 
                     elapsed = time.time() - t0
                     frame_ts.append(elapsed)
                     if len(frame_ts) > 30:
                         frame_ts.pop(0)
-                    fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
                     with _det_lock:
-                        _det_state['fps'] = fps
+                        _det_state['fps'] = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
 
     except Exception as exc:
         msg = f"Detection loop crashed: {exc}"
         logger.error(msg, exc_info=True)
         with _det_lock:
-            _det_state['running'] = False
+            _det_state['running']    = False
             _det_state['last_error'] = msg
 
     with _det_lock:
         _det_state['running'] = False
-        _det_state['thread'] = None
+        _det_state['thread']  = None
     logger.info("Detection loop stopped")
+
+
+@app.route('/api/detection/modes')
+def detection_modes_route():
+    return jsonify(AIM_MODES)
 
 
 @app.route('/api/detection/last-error')
@@ -526,26 +583,47 @@ def detection_start():
     with _det_lock:
         if _det_state['running']:
             return jsonify({'ok': False, 'error': 'Already running'})
-    d             = request.json or {}
-    classes       = d.get('classes', ['person'])
-    confidence    = float(d.get('confidence', 0.25))
-    cooldown_ms   = float(d.get('cooldown_ms', 400))
-    fov_config    = d.get('fov_config')
-    max_mvmt_ms   = float(d.get('max_movement_ms', 120))
-    interval_ms   = float(d.get('interval_ms', 1.0))
-    aim_height    = float(d.get('aim_height', 0.25))
+    d      = request.json or {}
+    mode   = d.get('mode', 'track')
+    preset = AIM_MODES.get(mode, AIM_MODES['track']).copy()
+
+    classes         = d.get('classes',         ['person', 'head'])
+    confidence      = float(d.get('confidence',      0.25))
+    cooldown_ms     = float(d.get('cooldown_ms',     preset['cooldown_ms']))
+    fov_config      = d.get('fov_config')
+    max_mvmt_ms     = float(d.get('max_movement_ms', preset['max_movement_ms']))
+    interval_ms     = float(d.get('interval_ms',     preset['interval_ms']))
+    aim_height      = float(d.get('aim_height',      preset['aim_height']))
+    lead_ms         = float(d.get('lead_ms',         0.0))
+    rcs_strength    = float(d.get('rcs_strength',    0.0))
+    target_radius   = float(d.get('target_radius',   preset['target_radius']))
+    progress_center = float(d.get('progress_center', preset['progress_center']))
 
     with _det_lock:
-        _det_state.update({'running': True, 'hits': 0, 'fps': 0.0, 'last_px': None, 'classes': classes})
+        _det_state.update({
+            'running': True, 'hits': 0, 'fps': 0.0,
+            'last_px': None, 'velocity': None,
+            'classes': classes, 'mode': mode,
+            'config': {
+                'mode': mode, 'confidence': confidence, 'cooldown_ms': cooldown_ms,
+                'max_movement_ms': max_mvmt_ms, 'interval_ms': interval_ms,
+                'aim_height': aim_height, 'lead_ms': lead_ms,
+                'rcs_strength': rcs_strength, 'target_radius': target_radius,
+                'progress_center': progress_center,
+            },
+            'last_error': None,
+        })
     t = threading.Thread(
         target=_run_detection,
-        args=(classes, confidence, cooldown_ms, fov_config, max_mvmt_ms, interval_ms, aim_height),
+        args=(classes, confidence, cooldown_ms, fov_config,
+              max_mvmt_ms, interval_ms, aim_height, mode,
+              lead_ms, rcs_strength, target_radius, progress_center),
         daemon=True,
     )
     with _det_lock:
         _det_state['thread'] = t
     t.start()
-    return jsonify({'ok': True, 'classes': classes})
+    return jsonify({'ok': True, 'classes': classes, 'mode': mode})
 
 
 @app.route('/api/detection/stop', methods=['POST'])
@@ -559,10 +637,13 @@ def detection_stop():
 def detection_status():
     with _det_lock:
         return jsonify({
-            'running': _det_state['running'],
-            'fps':     _det_state['fps'],
-            'hits':    _det_state['hits'],
-            'last_px': _det_state['last_px'],
+            'running':  _det_state['running'],
+            'fps':      _det_state['fps'],
+            'hits':     _det_state['hits'],
+            'last_px':  _det_state['last_px'],
+            'velocity': _det_state['velocity'],
+            'mode':     _det_state['mode'],
+            'config':   _det_state['config'],
         })
 
 

@@ -24,7 +24,7 @@ export default function Device() {
 
   const [selectedPort, setSelectedPort] = useState('')
   const [selectedBaud, setSelectedBaud] = useState(() =>
-    Number(localStorage.getItem('defaultBaud') || 921600)
+    Number(localStorage.getItem('defaultBaud') || 4000000)
   )
   const [selectedProto, setSelectedProto] = useState<'makcu' | 'text' | 'ch9329' | 'raw_binary'>('makcu')
 
@@ -58,10 +58,15 @@ export default function Device() {
   const [detRunning, setDetRunning]       = useState(false)
   const [detFps, setDetFps]               = useState(0)
   const [detHits, setDetHits]             = useState(0)
-  const [detClasses, setDetClasses]       = useState('person, player')
+  const [detClasses, setDetClasses]       = useState('person, head')
   const [detConfidence, setDetConfidence] = useState(0.25)
-  const [detCooldown, setDetCooldown]     = useState(400)
+  const [detCooldown, setDetCooldown]     = useState(150)
   const [detStarting, setDetStarting]     = useState(false)
+  const [detMode, setDetMode]             = useState<'snap'|'track'|'smooth'>('track')
+  const [detAimHeight, setDetAimHeight]   = useState(0.12)
+  const [detLeadMs, setDetLeadMs]         = useState(30)
+  const [detRcs, setDetRcs]               = useState(0)
+  const [detVelocity, setDetVelocity]     = useState<[number,number]|null>(null)
 
   // Triggerbot state (synced from Settings)
   const [triggerEnabled, setTriggerEnabled] = useState(() =>
@@ -292,9 +297,14 @@ export default function Device() {
         const s = await api.detection.status()
         setDetFps(s.fps)
         setDetHits(s.hits)
-        if (!s.running) { setDetRunning(false); addLog('Auto-detect stopped', 'log-warn') }
+        setDetVelocity(s.velocity ?? null)
+        if (!s.running) {
+          setDetRunning(false)
+          setDetVelocity(null)
+          addLog('Auto-detect stopped', 'log-warn')
+        }
       } catch {}
-    }, 1000)
+    }, 500)
     return () => clearInterval(t)
   }, [detRunning, addLog])
 
@@ -307,22 +317,23 @@ export default function Device() {
     }
     setDetStarting(true)
     const classList = detClasses.split(',').map(s => s.trim()).filter(Boolean)
-    addLog(`Starting auto-detect for: ${classList.join(', ')} (conf ${Math.round(detConfidence * 100)}%)…`, 'log-dim')
+    addLog(`Starting auto-detect [${detMode.toUpperCase()}] for: ${classList.join(', ')} (conf ${Math.round(detConfidence * 100)}%)…`, 'log-dim')
     try {
       const r = await api.detection.start({
-        classes:         classList,
-        confidence:      detConfidence,
-        cooldown_ms:     detCooldown,
-        fov_config:      { dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 },
-        max_movement_ms: 120,
-        interval_ms:     1.0,
-        aim_height:      0.25,
+        classes:      classList,
+        mode:         detMode,
+        confidence:   detConfidence,
+        cooldown_ms:  detCooldown,
+        fov_config:   { dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 },
+        aim_height:   detAimHeight,
+        lead_ms:      detMode === 'snap' ? 0 : detLeadMs,
+        rcs_strength: detRcs / 100,
       })
       if (r.ok) {
         setDetRunning(true)
         setDetHits(0)
-        addLog(`✓ Auto-detect running — watching for: ${r.classes?.join(', ')}`, 'log-success')
-        addLog('YOLO-World zero-shot: no training needed. First run downloads ~100 MB.', 'log-dim')
+        addLog(`✓ Auto-detect [${r.mode?.toUpperCase()}] running — ${r.classes?.join(', ')}`, 'log-success')
+        addLog('YOLO-World zero-shot: no training needed. First run ~100MB download.', 'log-dim')
       } else {
         addLog(`Auto-detect error: ${r.error}`, 'log-error')
       }
@@ -331,7 +342,7 @@ export default function Device() {
     } finally {
       setDetStarting(false)
     }
-  }, [detRunning, detClasses, detConfidence, detCooldown, addLog])
+  }, [detRunning, detClasses, detConfidence, detCooldown, detMode, detAimHeight, detLeadMs, detRcs, addLog])
 
   // Load default quickfire params from example data
   const [loadingDefault, setLoadingDefault] = useState(false)
@@ -1004,36 +1015,77 @@ export default function Device() {
               )}
             </div>
 
+            {/* Live stats bar */}
             {detRunning && (
               <div style={{
-                display: 'flex', gap: 20, padding: '10px 12px', marginBottom: 12,
+                display: 'flex', gap: 0, marginBottom: 12,
                 background: 'rgba(180,74,255,0.05)', border: '1px solid rgba(180,74,255,0.12)',
-                borderRadius: 6,
+                borderRadius: 6, overflow: 'hidden',
               }}>
-                {[['FPS', detFps], ['Shots Fired', detHits]].map(([l, v]) => (
-                  <div key={l as string}>
-                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{l}</div>
-                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 14, color: '#b44aff', fontWeight: 700 }}>{v}</div>
+                {([
+                  ['FPS',   String(detFps)],
+                  ['Shots', String(detHits)],
+                  ['Mode',  detMode.toUpperCase()],
+                  ['Vel ↔', detVelocity ? `${detVelocity[0] > 0 ? '+' : ''}${Math.round(detVelocity[0])}` : '—'],
+                  ['Vel ↕', detVelocity ? `${detVelocity[1] > 0 ? '+' : ''}${Math.round(detVelocity[1])}` : '—'],
+                ] as [string, string][]).map(([l, v], i) => (
+                  <div key={l} style={{
+                    flex: 1, padding: '8px 6px', textAlign: 'center',
+                    borderRight: i < 4 ? '1px solid rgba(180,74,255,0.08)' : undefined,
+                  }}>
+                    <div style={{ fontSize: 9, color: 'rgba(126,200,227,0.35)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{l}</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 13, color: '#b44aff', fontWeight: 700 }}>{v}</div>
                   </div>
                 ))}
               </div>
             )}
 
+            {/* Mode selector */}
+            <div style={{ marginBottom: 10 }}>
+              <label className="form-label">Aim Mode</label>
+              <div style={{ display: 'flex', gap: 4 }}>
+                {([
+                  { v: 'snap',   label: 'SNAP',   color: '#ff4444', desc: '40ms snap · head level · no lead' },
+                  { v: 'track',  label: 'TRACK',  color: '#b44aff', desc: '80ms tracking · velocity lead · balanced' },
+                  { v: 'smooth', label: 'SMOOTH', color: '#00d4ff', desc: '160ms arc · chest aim · human-like' },
+                ] as const).map(m => (
+                  <button key={m.v} onClick={() => {
+                    if (!detRunning) {
+                      setDetMode(m.v)
+                      setDetCooldown(m.v === 'snap' ? 80 : m.v === 'track' ? 150 : 350)
+                      setDetAimHeight(m.v === 'snap' ? 0.10 : m.v === 'track' ? 0.12 : 0.15)
+                    }
+                  }} disabled={detRunning} style={{
+                    flex: 1, padding: '6px 4px', border: `1px solid ${detMode === m.v ? m.color : 'rgba(126,200,227,0.12)'}`,
+                    borderRadius: 5, background: detMode === m.v ? `${m.color}18` : 'transparent',
+                    color: detMode === m.v ? m.color : 'rgba(126,200,227,0.45)',
+                    fontSize: 10, fontWeight: 700, letterSpacing: '0.06em', cursor: detRunning ? 'default' : 'pointer',
+                    transition: 'all 0.15s',
+                  }}>{m.label}</button>
+                ))}
+              </div>
+              <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', marginTop: 4 }}>
+                {detMode === 'snap' ? '40ms snap · head level · no lead' : detMode === 'track' ? '80ms tracking · velocity lead · balanced' : '160ms arc · chest aim · human-like'}
+              </div>
+            </div>
+
+            {/* Detect text prompt */}
             <div className="form-group" style={{ marginBottom: 10 }}>
               <label className="form-label">Detect (text prompt)</label>
               <input
                 className="form-input"
                 value={detClasses}
                 onChange={e => setDetClasses(e.target.value)}
-                placeholder="person, player, enemy"
+                placeholder="person, head"
                 disabled={detRunning}
               />
               <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
-                Describe what to aim at — YOLO-World finds it with no training
+                YOLO-World finds it zero-shot — no training needed
               </span>
             </div>
 
-            <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+            {/* Confidence + Cooldown */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
               <div style={{ flex: 1 }}>
                 <label className="form-label">Confidence</label>
                 <input type="range" min={0.1} max={0.9} step={0.05} value={detConfidence}
@@ -1045,7 +1097,7 @@ export default function Device() {
               </div>
               <div style={{ flex: 1 }}>
                 <label className="form-label">Fire Cooldown</label>
-                <input type="range" min={100} max={2000} step={50} value={detCooldown}
+                <input type="range" min={50} max={1000} step={10} value={detCooldown}
                   onChange={e => setDetCooldown(Number(e.target.value))} disabled={detRunning}
                   style={{ width: '100%' }} />
                 <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textAlign: 'center' }}>
@@ -1053,6 +1105,45 @@ export default function Device() {
                 </div>
               </div>
             </div>
+
+            {/* Aim Height + RCS */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">Aim Height</label>
+                <input type="range" min={0.0} max={0.4} step={0.01} value={detAimHeight}
+                  onChange={e => setDetAimHeight(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%' }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textAlign: 'center' }}>
+                  {detAimHeight <= 0.08 ? 'Head' : detAimHeight <= 0.14 ? 'Neck' : detAimHeight <= 0.22 ? 'Chest' : 'Body'} ({Math.round(detAimHeight * 100)}%)
+                </div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="form-label" style={{ color: detRcs > 0 ? '#ff8c00' : undefined }}>
+                  Recoil Comp {detRcs > 0 ? `(${detRcs}%)` : '(off)'}
+                </label>
+                <input type="range" min={0} max={100} step={5} value={detRcs}
+                  onChange={e => setDetRcs(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%', accentColor: detRcs > 0 ? '#ff8c00' : undefined }} />
+                <div style={{ fontSize: 10, color: detRcs > 0 ? 'rgba(255,140,0,0.6)' : 'rgba(126,200,227,0.25)', textAlign: 'center' }}>
+                  {detRcs === 0 ? 'Off' : detRcs <= 30 ? 'Light' : detRcs <= 60 ? 'Medium' : 'Heavy'} counter-pull
+                </div>
+              </div>
+            </div>
+
+            {/* Target Lead (track/smooth only) */}
+            {detMode !== 'snap' && (
+              <div style={{ marginBottom: 10 }}>
+                <label className="form-label" style={{ color: detLeadMs > 0 ? '#b44aff' : undefined }}>
+                  Target Lead {detLeadMs > 0 ? `(+${detLeadMs}ms)` : '(off)'}
+                </label>
+                <input type="range" min={0} max={80} step={5} value={detLeadMs}
+                  onChange={e => setDetLeadMs(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%', accentColor: detLeadMs > 0 ? '#b44aff' : undefined }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textAlign: 'center' }}>
+                  {detLeadMs === 0 ? 'Disabled — aim at current position' : `Aim ${detLeadMs}ms ahead — helps strafing targets`}
+                </div>
+              </div>
+            )}
 
             <button
               className="btn btn-primary"
@@ -1069,15 +1160,15 @@ export default function Device() {
                 ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Starting…</>
                 : detRunning
                   ? '■ Stop Detection'
-                  : '▶ Start Auto-Detect & Fire'}
+                  : `▶ Start [${detMode.toUpperCase()}]`}
             </button>
             {!connected && !detRunning && (
               <div style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)', textAlign: 'center', marginTop: 6 }}>
                 Connect MAKCU first
               </div>
             )}
-            <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.25)', textAlign: 'center', marginTop: 6 }}>
-              Captures center 640×640px · YOLO-World · no labeling needed
+            <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.2)', textAlign: 'center', marginTop: 6 }}>
+              Center 640×640px · YOLO-World GPU · IOU 0.4 · dxcam
             </div>
           </div>
 
