@@ -251,6 +251,19 @@ def serial_connect():
     return jsonify(result)
 
 
+@app.route('/api/serial/connect-makcu', methods=['POST'])
+def serial_connect_makcu():
+    """Auto-negotiate baud rate and connect using the MAKCU Native API protocol."""
+    d = request.json or {}
+    port = d.get('port', '')
+    if not port:
+        return jsonify({'ok': False, 'error': 'port is required'}), 400
+    result = serial_mgr.connect_makcu(port)
+    if result['ok']:
+        socketio.emit('serial_status', serial_mgr.status)
+    return jsonify(result)
+
+
 @app.route('/api/serial/disconnect', methods=['POST'])
 def serial_disconnect():
     result = serial_mgr.disconnect()

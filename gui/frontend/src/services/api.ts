@@ -153,8 +153,9 @@ export const api = {
   serial: {
     ports:       () => get<{ ports: SerialPort[] }>('/serial/ports'),
     status:      () => get<SerialStatus>('/serial/status'),
-    connect:     (req: SerialConnectRequest) => post<{ ok: boolean; error?: string }>('/serial/connect', req),
-    disconnect:  () => post<{ ok: boolean }>('/serial/disconnect'),
+    connect:        (req: SerialConnectRequest) => post<{ ok: boolean; error?: string }>('/serial/connect', req),
+    connectMakcu:   (port: string) => post<{ ok: boolean; baud?: number; error?: string }>('/serial/connect-makcu', { port }),
+    disconnect:     () => post<{ ok: boolean }>('/serial/disconnect'),
     sendReports: (reports: [number, number][], interval_ms = 1.0) =>
                    post<{ ok: boolean; message: string; total: number }>(
                      '/serial/send-reports', { reports, interval_ms }),

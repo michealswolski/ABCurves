@@ -5,8 +5,9 @@ reports, and streaming real-time TX stats back to the frontend.
 
 Supported protocols
 -------------------
-text      : "M {dx} {dy}\\n"            (most Arduino / Pico firmwares)
-ch9329    : 8-byte binary CH9329 packet  (common bare MAKCU boards)
+makcu     : km.move(x,y)\\r\\n  — official MAKCU Native API (v3.2 / v3.7 firmware)
+text      : "M {dx} {dy}\\n"   — generic Arduino / Pico text firmwares
+ch9329    : 8-byte binary CH9329 packet
 raw_binary: 4-byte little-endian int16 pairs [dx, dy] per report
 """
 
@@ -21,6 +22,11 @@ import serial
 import serial.tools.list_ports
 
 logger = logging.getLogger(__name__)
+
+# Binary frame that switches a MAKCU device from 115200 → 4 Mbaud
+# Format: DE AD | payload_len(u16-LE) | cmd=0xA5 | baud(u32-LE=4000000=0x003D0900)
+MAKCU_BAUD_CHANGE_FRAME = bytes([0xDE, 0xAD, 0x05, 0x00, 0xA5, 0x00, 0x09, 0x3D, 0x00])
+MAKCU_OPERATING_BAUD = 4_000_000
 
 
 # ── CH9329 constants ──────────────────────────────────────────────────────────
@@ -41,6 +47,13 @@ def _ch9329_packet(dx: int, dy: int) -> bytes:
                   length, *data, checksum])
 
 
+def _makcu_packet(dx: int, dy: int) -> bytes:
+    """Official MAKCU Native API: km.move(x,y)\r\n  Range: -32767..+32767."""
+    dx = max(-32767, min(32767, dx))
+    dy = max(-32767, min(32767, dy))
+    return f"km.move({dx},{dy})\r\n".encode()
+
+
 def _text_packet(dx: int, dy: int) -> bytes:
     return f"M {dx} {dy}\n".encode()
 
@@ -50,6 +63,7 @@ def _raw_packet(dx: int, dy: int) -> bytes:
 
 
 PROTOCOLS = {
+    "makcu":      _makcu_packet,
     "text":       _text_packet,
     "ch9329":     _ch9329_packet,
     "raw_binary": _raw_packet,
@@ -124,6 +138,61 @@ class SerialManager:
             except serial.SerialException as exc:
                 logger.error("Connect failed: %s", exc)
                 return {"ok": False, "error": str(exc)}
+
+    def connect_makcu(self, port: str) -> dict:
+        """Full MAKCU baud-negotiation sequence (per official docs).
+
+        1. Try 4 Mbaud — if km.version() returns km.MAKCU we're done.
+        2. Else open at 115200, send the 9-byte baud-change frame, wait, reopen at 4 Mbaud.
+        Sets protocol to 'makcu' on success.
+        """
+        with self._lock:
+            if self._port and self._port.is_open:
+                self._port.close()
+            self._port = None
+
+        def _try_at_baud(baud: int, flush_wait: float = 0) -> bool:
+            try:
+                s = serial.Serial(port, baud, timeout=0.5, write_timeout=1.0)
+                if flush_wait:
+                    time.sleep(flush_wait)
+                    s.reset_input_buffer()
+                s.write(b"km.version()\r\n")
+                resp = b""
+                deadline = time.time() + 0.5
+                while time.time() < deadline:
+                    resp += s.read(64)
+                    if b"km.MAKCU" in resp:
+                        with self._lock:
+                            self._port = s
+                            self._port_name = port
+                            self._baud = baud
+                            self._protocol = "makcu"
+                            self._stats = SerialStats()
+                        logger.info("MAKCU connected on %s @ %d baud", port, baud)
+                        return True
+                s.close()
+            except serial.SerialException:
+                pass
+            return False
+
+        # Step 1: try operating baud first (device may already be switched)
+        if _try_at_baud(MAKCU_OPERATING_BAUD):
+            return {"ok": True, "port": port, "baud": MAKCU_OPERATING_BAUD, "protocol": "makcu"}
+
+        # Step 2: switch from default baud via binary frame
+        try:
+            s = serial.Serial(port, 115200, timeout=0.1, write_timeout=1.0)
+            s.write(MAKCU_BAUD_CHANGE_FRAME)
+            time.sleep(0.1)
+            s.close()
+        except serial.SerialException as exc:
+            return {"ok": False, "error": f"Baud-change frame failed: {exc}"}
+
+        if _try_at_baud(MAKCU_OPERATING_BAUD, flush_wait=0.05):
+            return {"ok": True, "port": port, "baud": MAKCU_OPERATING_BAUD, "protocol": "makcu"}
+
+        return {"ok": False, "error": "MAKCU not detected — check port and firmware version"}
 
     def disconnect(self) -> dict:
         with self._lock:
@@ -208,14 +277,20 @@ class SerialManager:
             return {"ok": False, "error": str(exc)}
 
     def click(self, button: str = "left") -> dict:
-        """Send a mouse click via the MAKCU (text-protocol only for now)."""
+        """Send a mouse click (press + release)."""
         if not self.is_connected:
             return {"ok": False, "error": "Not connected"}
-        cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
-        cmd = cmd_map.get(button, "CL\n").encode()
         try:
             with self._lock:
-                self._port.write(cmd)
+                if self._protocol == "makcu":
+                    # Official MAKCU Native API: km.left(1)\r\n then km.left(0)\r\n
+                    btn = {"left": "left", "right": "right", "middle": "middle"}.get(button, "left")
+                    self._port.write(f"km.{btn}(1)\r\n".encode())
+                    time.sleep(0.01)
+                    self._port.write(f"km.{btn}(0)\r\n".encode())
+                else:
+                    cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
+                    self._port.write(cmd_map.get(button, "CL\n").encode())
             return {"ok": True}
         except serial.SerialException as exc:
             return {"ok": False, "error": str(exc)}
@@ -256,10 +331,16 @@ class SerialManager:
                         self._stats.bytes_sent += len(pkt)
                         self._stats.reports_sent += 1
                 elif etype == "click":
-                    cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
-                    cmd = cmd_map.get(ev.get("button", "left"), "CL\n").encode()
+                    btn = ev.get("button", "left")
                     with self._lock:
-                        self._port.write(cmd)
+                        if self._protocol == "makcu":
+                            b = {"left": "left", "right": "right", "middle": "middle"}.get(btn, "left")
+                            self._port.write(f"km.{b}(1)\r\n".encode())
+                            time.sleep(0.01)
+                            self._port.write(f"km.{b}(0)\r\n".encode())
+                        else:
+                            cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
+                            self._port.write(cmd_map.get(btn, "CL\n").encode())
                 elif etype == "pause":
                     time.sleep(float(ev.get("ms", 50)) / 1000.0)
             except serial.SerialException as exc:

@@ -6,9 +6,10 @@ import {
 } from 'lucide-react'
 import { api, SerialPort, SerialStatus, MacroEvent } from '../services/api'
 
-const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 4000000]
 const PROTOCOLS: { value: string; label: string; desc: string }[] = [
-  { value: 'text',       label: 'Text (M dx dy)',   desc: 'ASCII "M {dx} {dy}\\n" — most Arduino / Pico firmwares' },
+  { value: 'makcu',      label: 'MAKCU Native',     desc: 'km.move(x,y)\\r\\n — official MAKCU firmware (v3.2 / v3.7). Use Auto-Connect below.' },
+  { value: 'text',       label: 'Text (M dx dy)',   desc: 'ASCII "M {dx} {dy}\\n" — generic Arduino / Pico firmwares' },
   { value: 'ch9329',     label: 'CH9329 Binary',    desc: '8-byte binary packet — bare MAKCU boards with CH9329 chip' },
   { value: 'raw_binary', label: 'Raw Binary',       desc: '4-byte int16 pairs [dx, dy] per report' },
 ]
@@ -25,7 +26,7 @@ export default function Device() {
   const [selectedBaud, setSelectedBaud] = useState(() =>
     Number(localStorage.getItem('defaultBaud') || 921600)
   )
-  const [selectedProto, setSelectedProto] = useState<'text' | 'ch9329' | 'raw_binary'>('text')
+  const [selectedProto, setSelectedProto] = useState<'makcu' | 'text' | 'ch9329' | 'raw_binary'>('makcu')
 
   const [log, setLog] = useState<{ ts: string; cls: string; msg: string }[]>([])
   const [txProgress, setTxProgress] = useState<{ sent: number; total: number } | null>(null)
@@ -182,6 +183,20 @@ export default function Device() {
       addLog(`Connected to ${selectedPort}`, 'log-success')
     } else {
       addLog(`Connection failed: ${result.error}`, 'log-error')
+    }
+    await refreshStatus()
+    setConnecting(false)
+  }
+
+  const handleConnectMakcu = async () => {
+    if (!selectedPort) { addLog('Select a port first', 'log-warn'); return }
+    setConnecting(true)
+    addLog(`MAKCU Auto-Connect: trying 4 Mbaud → 115200 negotiation on ${selectedPort}…`)
+    const result = await api.serial.connectMakcu(selectedPort)
+    if (result.ok) {
+      addLog(`MAKCU connected on ${selectedPort} @ ${result.baud?.toLocaleString()} baud`, 'log-success')
+    } else {
+      addLog(`MAKCU Auto-Connect failed: ${result.error}`, 'log-error')
     }
     await refreshStatus()
     setConnecting(false)
@@ -380,7 +395,7 @@ export default function Device() {
             <div className="form-group">
               <label className="form-label">Protocol</label>
               <select className="form-input" value={selectedProto}
-                onChange={e => setSelectedProto(e.target.value as 'text' | 'ch9329' | 'raw_binary')}
+                onChange={e => setSelectedProto(e.target.value as 'makcu' | 'text' | 'ch9329' | 'raw_binary')}
                 disabled={connected}>
                 {PROTOCOLS.map(p => (
                   <option key={p.value} value={p.value}>{p.label}</option>
@@ -424,14 +439,23 @@ export default function Device() {
             </div>
 
             <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
-              {!connected ? (
+              {!connected ? (<>
+                {selectedProto === 'makcu' && (
+                  <button className="btn btn-primary" onClick={handleConnectMakcu}
+                    disabled={connecting || !selectedPort}
+                    style={{ flex: 1, justifyContent: 'center', background: 'rgba(57,255,20,0.12)', borderColor: 'rgba(57,255,20,0.4)', color: '#39ff14' }}>
+                    {connecting
+                      ? <><span className="spinner" style={{ width: 14, height: 14 }} /> Connecting…</>
+                      : <><Zap size={14} /> MAKCU Auto-Connect</>}
+                  </button>
+                )}
                 <button className="btn btn-primary" onClick={handleConnect} disabled={connecting || !selectedPort}
-                  style={{ flex: 1, justifyContent: 'center' }}>
+                  style={{ flex: selectedProto === 'makcu' ? 0 : 1, justifyContent: 'center', minWidth: selectedProto === 'makcu' ? 90 : undefined }}>
                   {connecting
                     ? <><span className="spinner" style={{ width: 14, height: 14 }} /> Connecting…</>
-                    : <><Zap size={14} /> Connect</>}
+                    : <><Zap size={14} /> {selectedProto === 'makcu' ? 'Manual' : 'Connect'}</>}
                 </button>
-              ) : (
+              </>) : (
                 <button className="btn btn-danger" onClick={handleDisconnect}
                   style={{ flex: 1, justifyContent: 'center' }}>
                   <ZapOff size={14} /> Disconnect
