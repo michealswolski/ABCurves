@@ -1,6 +1,7 @@
 """ABCurves Flask backend — includes MAKCU serial port integration."""
 
 import json
+import math
 import time
 import threading
 import numpy as np
@@ -255,6 +256,182 @@ def push_target():
     _live_target = {'x': cx, 'y': cy, 'px_x': px_x, 'px_y': px_y}
     socketio.emit('target_update', _live_target)
     return jsonify({'ok': True, 'counts': [cx, cy]})
+
+
+# ── Vision auto-detection ─────────────────────────────────────────────────────
+_det_state: dict = {
+    'running': False, 'fps': 0.0, 'hits': 0, 'last_px': None, 'thread': None, 'classes': [],
+}
+_det_lock = threading.Lock()
+
+
+def _run_detection(classes: list, confidence: float, cooldown_ms: float,
+                   fov_config: dict | None, max_movement_ms: float,
+                   interval_ms: float, aim_height: float):
+    try:
+        from ultralytics import YOLOWorld
+        import mss
+    except ImportError as exc:
+        logger.error("Detection deps missing — run: pip install ultralytics mss  (%s)", exc)
+        with _det_lock:
+            _det_state['running'] = False
+        return
+
+    logger.info("Loading YOLO-World (first run downloads ~100 MB)…")
+    try:
+        model = YOLOWorld('yolov8s-worldv2.pt')
+        model.set_classes(classes)
+    except Exception as exc:
+        logger.error("YOLO-World load failed: %s", exc)
+        with _det_lock:
+            _det_state['running'] = False
+        return
+    logger.info("YOLO-World ready, watching for: %s", classes)
+
+    # Prepare renderer profile once so the first fire is instant
+    renderer_profile = None
+    if pipeline is not None:
+        try:
+            rng = np.random.default_rng(0)
+            raw = rng.integers(-10, 10, (256, 2), dtype=np.int16)
+            renderer_profile = pipeline.prepare_renderer_profile(raw)
+        except Exception as exc:
+            logger.warning("Detection: renderer profile prep failed: %s", exc)
+
+    # FOV config → counts-per-pixel
+    if fov_config:
+        dpi  = float(fov_config.get('dpi', 400))
+        sens = float(fov_config.get('sensitivity', 3.2554))
+        fovH = float(fov_config.get('fovH', 106.26))
+        sw   = float(fov_config.get('screenW', 2560))
+    else:
+        dpi, sens, fovH, sw = 400.0, 3.2554, 106.26, 2560.0
+    cpp = (dpi / 400) / (sens * 0.022) * (fovH / sw)
+
+    max_reps = math.ceil(max_movement_ms / max(interval_ms, 0.5))
+    last_fire = 0.0
+    frame_ts: list = []
+
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        mw, mh = mon['width'], mon['height']
+        crop = 640
+        cap = {
+            'left':   mon['left'] + mw // 2 - crop // 2,
+            'top':    mon['top']  + mh // 2 - crop // 2,
+            'width':  crop, 'height': crop,
+        }
+        cx_rel, cy_rel = crop // 2, crop // 2
+
+        while True:
+            with _det_lock:
+                if not _det_state['running']:
+                    break
+
+            t0 = time.time()
+            frame = np.array(sct.grab(cap))[:, :, :3]
+
+            results = model(frame, conf=confidence, verbose=False)[0]
+            boxes = results.boxes
+
+            best_px, best_dist = None, float('inf')
+            if boxes is not None and len(boxes):
+                for box in boxes.xyxy.cpu().numpy():
+                    bx  = (box[0] + box[2]) / 2
+                    by  = box[1] + (box[3] - box[1]) * aim_height
+                    dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
+                    if dist < best_dist:
+                        best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
+
+            if best_px:
+                px_x, px_y = best_px
+                with _det_lock:
+                    _det_state['last_px'] = [round(px_x, 1), round(px_y, 1)]
+                socketio.emit('detection_update', {'px_x': px_x, 'px_y': px_y, 'dist': round(best_dist, 1)})
+
+                now = time.time()
+                if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+                    cx_c = round(px_x * cpp)
+                    cy_c = round(px_y * cpp)
+                    try:
+                        rng2 = np.random.default_rng(int(now * 1000) & 0xFFFF)
+                        prefix = rng2.standard_normal((20, 2)).astype(np.float32) * 2
+                        reports = pipeline.generate(
+                            prefix,
+                            renderer_profile=renderer_profile,
+                            target_rel_at_B=(cx_c, cy_c),
+                            target_radius=10,
+                            progress_center=0.5,
+                            seed=int(now * 1000) % 10000,
+                        ).tolist()[:max_reps]
+                        if reports:
+                            serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
+                            last_fire = now
+                            with _det_lock:
+                                _det_state['hits'] += 1
+                    except Exception as exc:
+                        logger.debug("Auto-fire error: %s", exc)
+            else:
+                with _det_lock:
+                    _det_state['last_px'] = None
+
+            elapsed = time.time() - t0
+            frame_ts.append(elapsed)
+            if len(frame_ts) > 30:
+                frame_ts.pop(0)
+            fps = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
+            with _det_lock:
+                _det_state['fps'] = fps
+
+    with _det_lock:
+        _det_state['running'] = False
+        _det_state['thread'] = None
+    logger.info("Detection loop stopped")
+
+
+@app.route('/api/detection/start', methods=['POST'])
+def detection_start():
+    with _det_lock:
+        if _det_state['running']:
+            return jsonify({'ok': False, 'error': 'Already running'})
+    d             = request.json or {}
+    classes       = d.get('classes', ['person'])
+    confidence    = float(d.get('confidence', 0.25))
+    cooldown_ms   = float(d.get('cooldown_ms', 400))
+    fov_config    = d.get('fov_config')
+    max_mvmt_ms   = float(d.get('max_movement_ms', 120))
+    interval_ms   = float(d.get('interval_ms', 1.0))
+    aim_height    = float(d.get('aim_height', 0.25))
+
+    with _det_lock:
+        _det_state.update({'running': True, 'hits': 0, 'fps': 0.0, 'last_px': None, 'classes': classes})
+    t = threading.Thread(
+        target=_run_detection,
+        args=(classes, confidence, cooldown_ms, fov_config, max_mvmt_ms, interval_ms, aim_height),
+        daemon=True,
+    )
+    with _det_lock:
+        _det_state['thread'] = t
+    t.start()
+    return jsonify({'ok': True, 'classes': classes})
+
+
+@app.route('/api/detection/stop', methods=['POST'])
+def detection_stop():
+    with _det_lock:
+        _det_state['running'] = False
+    return jsonify({'ok': True})
+
+
+@app.route('/api/detection/status')
+def detection_status():
+    with _det_lock:
+        return jsonify({
+            'running': _det_state['running'],
+            'fps':     _det_state['fps'],
+            'hits':    _det_state['hits'],
+            'last_px': _det_state['last_px'],
+        })
 
 
 @app.route('/api/example-data')

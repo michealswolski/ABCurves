@@ -54,6 +54,15 @@ export default function Device() {
   )
   const [capturingHotkey, setCapturingHotkey] = useState(false)
 
+  // Auto-detect & fire
+  const [detRunning, setDetRunning]       = useState(false)
+  const [detFps, setDetFps]               = useState(0)
+  const [detHits, setDetHits]             = useState(0)
+  const [detClasses, setDetClasses]       = useState('person, player')
+  const [detConfidence, setDetConfidence] = useState(0.25)
+  const [detCooldown, setDetCooldown]     = useState(400)
+  const [detStarting, setDetStarting]     = useState(false)
+
   // Triggerbot state (synced from Settings)
   const [triggerEnabled, setTriggerEnabled] = useState(() =>
     localStorage.getItem('triggerbot_enabled') === 'true')
@@ -274,6 +283,55 @@ export default function Device() {
       setReplayingMacro(false)
     }
   }
+
+  // Poll detection status while running
+  useEffect(() => {
+    if (!detRunning) return
+    const t = setInterval(async () => {
+      try {
+        const s = await api.detection.status()
+        setDetFps(s.fps)
+        setDetHits(s.hits)
+        if (!s.running) { setDetRunning(false); addLog('Auto-detect stopped', 'log-warn') }
+      } catch {}
+    }, 1000)
+    return () => clearInterval(t)
+  }, [detRunning, addLog])
+
+  const toggleDetection = useCallback(async () => {
+    if (detRunning) {
+      try { await api.detection.stop() } catch {}
+      setDetRunning(false)
+      addLog('Auto-detect stopped', 'log-warn')
+      return
+    }
+    setDetStarting(true)
+    const classList = detClasses.split(',').map(s => s.trim()).filter(Boolean)
+    addLog(`Starting auto-detect for: ${classList.join(', ')} (conf ${Math.round(detConfidence * 100)}%)…`, 'log-dim')
+    try {
+      const r = await api.detection.start({
+        classes:         classList,
+        confidence:      detConfidence,
+        cooldown_ms:     detCooldown,
+        fov_config:      { dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 },
+        max_movement_ms: 120,
+        interval_ms:     1.0,
+        aim_height:      0.25,
+      })
+      if (r.ok) {
+        setDetRunning(true)
+        setDetHits(0)
+        addLog(`✓ Auto-detect running — watching for: ${r.classes?.join(', ')}`, 'log-success')
+        addLog('YOLO-World zero-shot: no training needed. First run downloads ~100 MB.', 'log-dim')
+      } else {
+        addLog(`Auto-detect error: ${r.error}`, 'log-error')
+      }
+    } catch (e) {
+      addLog(`Auto-detect failed: ${e}`, 'log-error')
+    } finally {
+      setDetStarting(false)
+    }
+  }, [detRunning, detClasses, detConfidence, detCooldown, addLog])
 
   // Load default quickfire params from example data
   const [loadingDefault, setLoadingDefault] = useState(false)
@@ -924,6 +982,103 @@ export default function Device() {
                 Enable triggerbot to use — configure mode &amp; hotkey in Settings
               </div>
             )}
+          </div>
+
+          {/* Auto-Detect & Fire */}
+          <div className="card" style={{
+            background: 'rgba(5,5,18,0.9)',
+            border: detRunning ? '1px solid rgba(180,74,255,0.35)' : undefined,
+          }}>
+            <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: detRunning ? '#b44aff' : undefined }}>
+                {detRunning ? '● ' : ''}Auto-Detect &amp; Fire
+              </span>
+              {detRunning && (
+                <span style={{
+                  fontSize: 9, padding: '2px 7px', borderRadius: 10,
+                  background: 'rgba(180,74,255,0.12)', color: '#b44aff',
+                  border: '1px solid rgba(180,74,255,0.25)',
+                  letterSpacing: '0.1em', textTransform: 'uppercase', fontWeight: 700,
+                  animation: 'pulse-dot 1s ease-in-out infinite',
+                }}>LIVE</span>
+              )}
+            </div>
+
+            {detRunning && (
+              <div style={{
+                display: 'flex', gap: 20, padding: '10px 12px', marginBottom: 12,
+                background: 'rgba(180,74,255,0.05)', border: '1px solid rgba(180,74,255,0.12)',
+                borderRadius: 6,
+              }}>
+                {[['FPS', detFps], ['Shots Fired', detHits]].map(([l, v]) => (
+                  <div key={l as string}>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{l}</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 14, color: '#b44aff', fontWeight: 700 }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="form-group" style={{ marginBottom: 10 }}>
+              <label className="form-label">Detect (text prompt)</label>
+              <input
+                className="form-input"
+                value={detClasses}
+                onChange={e => setDetClasses(e.target.value)}
+                placeholder="person, player, enemy"
+                disabled={detRunning}
+              />
+              <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
+                Describe what to aim at — YOLO-World finds it with no training
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">Confidence</label>
+                <input type="range" min={0.1} max={0.9} step={0.05} value={detConfidence}
+                  onChange={e => setDetConfidence(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%' }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textAlign: 'center' }}>
+                  {Math.round(detConfidence * 100)}%
+                </div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">Fire Cooldown</label>
+                <input type="range" min={100} max={2000} step={50} value={detCooldown}
+                  onChange={e => setDetCooldown(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%' }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textAlign: 'center' }}>
+                  {detCooldown}ms
+                </div>
+              </div>
+            </div>
+
+            <button
+              className="btn btn-primary"
+              onClick={toggleDetection}
+              disabled={(!connected && !detRunning) || detStarting}
+              style={{
+                width: '100%', justifyContent: 'center', fontSize: 13,
+                background:   detRunning ? 'rgba(255,45,120,0.1)'   : 'rgba(180,74,255,0.12)',
+                borderColor:  detRunning ? 'rgba(255,45,120,0.35)'  : 'rgba(180,74,255,0.35)',
+                color:        detRunning ? '#ff2d78'                 : '#b44aff',
+              }}
+            >
+              {detStarting
+                ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Starting…</>
+                : detRunning
+                  ? '■ Stop Detection'
+                  : '▶ Start Auto-Detect & Fire'}
+            </button>
+            {!connected && !detRunning && (
+              <div style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)', textAlign: 'center', marginTop: 6 }}>
+                Connect MAKCU first
+              </div>
+            )}
+            <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.25)', textAlign: 'center', marginTop: 6 }}>
+              Captures center 640×640px · YOLO-World · no labeling needed
+            </div>
           </div>
 
           {/* Macro Recorder */}

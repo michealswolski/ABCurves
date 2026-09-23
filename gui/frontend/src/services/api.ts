@@ -178,6 +178,21 @@ export const api = {
   trainingConfig:     () => get<{ planner: TrainingConfig; renderer: TrainingConfig }>('/training/config'),
   saveTrainingConfig: (cfg: unknown) => post<{ success: boolean }>('/training/config', cfg),
 
+  // Vision auto-detection
+  detection: {
+    start: (opts: {
+      classes: string[]
+      confidence?: number
+      cooldown_ms?: number
+      fov_config?: { dpi: number; sensitivity: number; fovH: number; screenW: number }
+      max_movement_ms?: number
+      interval_ms?: number
+      aim_height?: number
+    }) => post<{ ok: boolean; classes?: string[]; error?: string }>('/detection/start', opts),
+    stop:   () => post<{ ok: boolean }>('/detection/stop'),
+    status: () => get<{ running: boolean; fps: number; hits: number; last_px: [number, number] | null }>('/detection/status'),
+  },
+
   // Results
   benchmarks:     () => get<BenchmarkResult>('/benchmarks'),
   detectionStudy: () => get<DetectionStudy>('/detection-study'),
