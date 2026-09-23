@@ -105,6 +105,7 @@ export default function Inference() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState<InferenceResult | null>(null)
+  const [rendererProfile, setRendererProfile] = useState<number[][] | null>(null)
 
   // Batch inference
   const [batchMode, setBatchMode] = useState(false)
@@ -206,6 +207,7 @@ export default function Inference() {
       const data = await api.exampleData()
       setPrefix(data.prefix); setPrefixText(JSON.stringify(data.prefix))
       setTarget(data.target); setPrefixError('')
+      setRendererProfile(data.profile ?? null)
     } catch {
       setPrefix(EXAMPLE_PREFIX); setPrefixText(JSON.stringify(EXAMPLE_PREFIX)); setTarget(EXAMPLE_TARGET)
     }
@@ -245,6 +247,7 @@ export default function Inference() {
       } else {
         const res = await api.runInference({
           prefix: trimmedPrefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
+          ...(rendererProfile ? { profile: rendererProfile } : {}),
         })
         setResult(res)
         setBatchResults([])
@@ -257,7 +260,7 @@ export default function Inference() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Inference failed')
     } finally { setLoading(false) }
-  }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN, predictedTarget])
+  }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN, predictedTarget, rendererProfile])
 
   // Space = run inference keyboard shortcut
   useEffect(() => {
