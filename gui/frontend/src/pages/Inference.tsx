@@ -22,6 +22,51 @@ function InputRow({ label, hint, children }: { label: string; hint?: string; chi
   )
 }
 
+function PixelConverter({ countsPerPixel, onConvert }: {
+  countsPerPixel: number | null
+  onConvert: (v: [number, number]) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [px, setPx] = useState<[number, number]>([0, 0])
+  if (!countsPerPixel) return null
+  return (
+    <div style={{ marginTop: -8, marginBottom: 10 }}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        style={{
+          fontSize: 10, color: 'rgba(0,212,255,0.5)', background: 'none',
+          border: 'none', cursor: 'pointer', padding: '2px 0', letterSpacing: '0.05em',
+        }}
+      >
+        {open ? '▾' : '▸'} convert from pixels
+      </button>
+      {open && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'flex-end' }}>
+          {(['X', 'Y'] as const).map((axis, i) => (
+            <div key={axis} style={{ flex: 1 }}>
+              <div style={{ fontSize: 10, color: 'rgba(0,212,255,0.4)', marginBottom: 2 }}>px {axis}</div>
+              <input type="number" className="form-input" style={{ width: '100%' }}
+                value={px[i]}
+                onChange={e => { const v = [...px] as [number, number]; v[i] = Number(e.target.value); setPx(v) }} />
+            </div>
+          ))}
+          <button className="btn btn-secondary"
+            style={{ padding: '4px 10px', fontSize: 11, whiteSpace: 'nowrap', marginBottom: 0 }}
+            onClick={() => {
+              onConvert([
+                Math.round(px[0] * countsPerPixel),
+                Math.round(px[1] * countsPerPixel),
+              ])
+              setOpen(false)
+            }}>
+            → counts
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function XYInput({ label, value, onChange }: {
   label: string; value: [number, number]; onChange: (v: [number, number]) => void
 }) {
@@ -169,11 +214,13 @@ export default function Inference() {
     const actualSeed = seedLocked ? seed : Math.floor(Math.random() * 100000)
     if (!seedLocked) setSeed(actualSeed)
     const effectiveTarget = predictedTarget ?? target
+    // Model was trained on up to 160 prefix deltas — trim from the end (most recent)
+    const trimmedPrefix = prefix.slice(-160)
 
     try {
       if (batchMode) {
         const res = await api.batchInference({
-          prefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter,
+          prefix: trimmedPrefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter,
           seed: actualSeed, n: batchN,
         })
         setBatchResults(res.results)
@@ -192,7 +239,7 @@ export default function Inference() {
         }
       } else {
         const res = await api.runInference({
-          prefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
+          prefix: trimmedPrefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
         })
         setResult(res)
         setBatchResults([])
@@ -296,12 +343,13 @@ export default function Inference() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
             <div className="section-header">Parameters</div>
-            <XYInput label="Target Position" value={target} onChange={setTarget} />
-            <InputRow label="Target Radius" hint="Acceptance radius in pixels">
+            <XYInput label="Target Offset B→C (mouse counts)" value={target} onChange={setTarget} />
+            <PixelConverter countsPerPixel={countsPerPixel} onConvert={setTarget} />
+            <InputRow label="Target Radius" hint="Acceptance radius in counts">
               <input type="number" className="form-input" style={{ width: '100%' }} value={radius}
                 onChange={e => setRadius(Number(e.target.value))} min={5} max={200} />
             </InputRow>
-            <InputRow label="Progress Center" hint="0.0 – 1.0  (proportion at cut point B)">
+            <InputRow label="Progress Center" hint="Cut point B — 0.6–0.8 recommended (player covers that naturally)">
               <input type="range" style={{ width: '100%', accentColor: '#00d4ff' }}
                 value={progressCenter} min={0} max={1} step={0.05}
                 onChange={e => setProgressCenter(Number(e.target.value))} />
@@ -360,7 +408,9 @@ export default function Inference() {
               />
               {prefixError && <span style={{ color: '#ff2d78', fontSize: 11 }}>{prefixError}</span>}
               <span style={{ fontSize: 11, color: 'rgba(0,212,255,0.4)', fontFamily: 'JetBrains Mono' }}>
-                {prefix.length} points loaded
+                {prefix.length} points loaded{prefix.length > 160 && (
+                  <span style={{ color: 'rgba(255,140,0,0.7)' }}> — trimmed to last 160</span>
+                )}
               </span>
             </div>
             <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }}
