@@ -224,6 +224,19 @@ input, select, textarea {
   font-size: 14px;
   outline: none;
   transition: all 0.2s ease;
+  color-scheme: dark;
+}
+
+/* Fix native select dropdown option colors */
+select option {
+  background: #0b0b20;
+  color: #e8f4ff;
+}
+
+select option:checked,
+select option:hover {
+  background: rgba(0, 212, 255, 0.15);
+  color: #00d4ff;
 }
 
 .form-group {

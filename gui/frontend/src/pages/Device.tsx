@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
-  Usb, RefreshCw, Zap, ZapOff, Send, Mouse, ChevronRight,
+  Usb, RefreshCw, Zap, ZapOff, Send, ChevronRight,
   Activity, AlertCircle, CheckCircle2, Circle,
 } from 'lucide-react'
 import { api, SerialPort, SerialStatus, MacroEvent } from '../services/api'
@@ -13,6 +14,8 @@ const PROTOCOLS: { value: string; label: string; desc: string }[] = [
 ]
 
 export default function Device() {
+  const navigate = useNavigate()
+
   const [ports, setPorts] = useState<SerialPort[]>([])
   const [status, setStatus] = useState<SerialStatus | null>(null)
   const [scanning, setScanning] = useState(false)
@@ -20,15 +23,12 @@ export default function Device() {
 
   const [selectedPort, setSelectedPort] = useState('')
   const [selectedBaud, setSelectedBaud] = useState(() =>
-    Number(localStorage.getItem('defaultBaud') || 115200)
+    Number(localStorage.getItem('defaultBaud') || 921600)
   )
   const [selectedProto, setSelectedProto] = useState<'text' | 'ch9329' | 'raw_binary'>('text')
 
   const [log, setLog] = useState<{ ts: string; cls: string; msg: string }[]>([])
   const [txProgress, setTxProgress] = useState<{ sent: number; total: number } | null>(null)
-
-  // Jog speed
-  const [jogStep, setJogStep] = useState(20)
 
   // Auto-reconnect
   const [autoReconnect, setAutoReconnect] = useState(false)
@@ -41,6 +41,17 @@ export default function Device() {
   const [replayingMacro, setReplayingMacro] = useState(false)
   const macroRecordingRef = useRef(false)
   const macroEventsRef = useRef<MacroEvent[]>([])
+
+  // Quick Fire
+  const [quickfireParams, setQuickfireParams] = useState<any>(null)
+  const [firing, setFiring] = useState(false)
+  const [lastFiredTime, setLastFiredTime] = useState<string | null>(null)
+
+  // Hotkey
+  const [hotkeyKey, setHotkeyKey] = useState<string>(
+    () => localStorage.getItem('quickfire_hotkey') || 'F1'
+  )
+  const [capturingHotkey, setCapturingHotkey] = useState(false)
 
   // Keep refs in sync
   useEffect(() => { macroRecordingRef.current = macroRecording }, [macroRecording])
@@ -56,6 +67,21 @@ export default function Device() {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
   }, [log])
+
+  // Read quickfire params from localStorage on mount and window focus
+  useEffect(() => {
+    const readParams = () => {
+      const raw = localStorage.getItem('quickfire_params')
+      try {
+        setQuickfireParams(raw ? JSON.parse(raw) : null)
+      } catch {
+        setQuickfireParams(null)
+      }
+    }
+    readParams()
+    window.addEventListener('focus', readParams)
+    return () => window.removeEventListener('focus', readParams)
+  }, [])
 
   // WebSocket for serial events + macro events
   useEffect(() => {
@@ -169,27 +195,13 @@ export default function Device() {
     addLog('Disconnected', 'log-warn')
   }
 
+  const connected = status?.connected ?? false
+
   const recordEvent = useCallback((event: MacroEvent) => {
     if (macroRecordingRef.current) {
       setMacroEvents(prev => [...prev, event])
     }
   }, [])
-
-  const jog = async (dx: number, dy: number) => {
-    const r = await api.serial.sendSingle(dx, dy)
-    if (r.ok) {
-      addLog(`Jog (${dx > 0 ? '+' : ''}${dx}, ${dy > 0 ? '+' : ''}${dy})`, 'log-dim')
-      recordEvent({ type: 'move', dx, dy })
-    } else addLog(`Jog failed: ${r.error}`, 'log-error')
-  }
-
-  const click = async (btn: 'left' | 'right' | 'middle') => {
-    const r = await api.serial.click(btn)
-    if (r.ok) {
-      addLog(`Click ${btn}`, 'log-success')
-      recordEvent({ type: 'click', button: btn })
-    } else addLog(`Click failed: ${r.error}`, 'log-error')
-  }
 
   const startRecording = () => {
     setMacroEvents([])
@@ -214,7 +226,63 @@ export default function Device() {
     }
   }
 
-  const connected = status?.connected ?? false
+  // Quick Fire action
+  const fireQuickFire = useCallback(async () => {
+    const paramsStr = localStorage.getItem('quickfire_params')
+    if (!paramsStr) {
+      addLog('No quickfire params — run inference first on the Inference page', 'log-warn')
+      return
+    }
+    let params: any
+    try {
+      params = JSON.parse(paramsStr)
+    } catch {
+      addLog('Invalid quickfire_params in localStorage', 'log-error')
+      return
+    }
+    setFiring(true)
+    try {
+      addLog('⚡ Quick Fire: running inference…', 'log-dim')
+      const result = await (api as any).runInference(params)
+      if (connected) {
+        addLog('Sending reports to MAKCU…', 'log-dim')
+        await (api.serial as any).sendReports(result.continuation, 1.0)
+        addLog('✓ Quick Fire complete!', 'log-success')
+      } else {
+        addLog('Inference complete but device not connected — reports not sent', 'log-warn')
+      }
+      setLastFiredTime(new Date().toLocaleTimeString('en-US', { hour12: false }))
+    } catch (e) {
+      addLog(`Quick Fire error: ${e}`, 'log-error')
+    } finally {
+      setFiring(false)
+    }
+  }, [connected, addLog])
+
+  // Hotkey listener: capture new hotkey OR trigger Quick Fire on configured key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (capturingHotkey) {
+        if (['Escape', 'Tab', 'Enter'].includes(e.key)) return
+        e.preventDefault()
+        localStorage.setItem('quickfire_hotkey', e.key)
+        setHotkeyKey(e.key)
+        setCapturingHotkey(false)
+        return
+      }
+      if (e.key === hotkeyKey) {
+        const paramsStr = localStorage.getItem('quickfire_params')
+        if (connected && paramsStr) {
+          e.preventDefault()
+          fireQuickFire()
+        }
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [connected, hotkeyKey, capturingHotkey, fireQuickFire])
+
+  const armed = connected && quickfireParams !== null
 
   return (
     <div className="page animate-in">
@@ -426,80 +494,176 @@ export default function Device() {
           )}
         </div>
 
-        {/* ── Right: Manual control + macro + console ── */}
+        {/* ── Right: Quick Fire + hotkey + macro + console ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-          {/* Jog pad */}
-          <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
-            <div className="section-header"><Mouse size={13} /> Manual Control</div>
-            {!connected && (
+          {/* Quick Fire card */}
+          <div className="card" style={{
+            background: 'rgba(5,5,18,0.9)',
+            border: armed ? '1px solid rgba(0,212,255,0.25)' : undefined,
+          }}>
+            <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>⚡ Quick Fire</span>
+              {armed && (
+                <span style={{
+                  fontSize: 9, padding: '2px 7px', borderRadius: 10,
+                  background: 'rgba(57,255,20,0.12)', color: '#39ff14',
+                  border: '1px solid rgba(57,255,20,0.25)',
+                  letterSpacing: '0.1em', textTransform: 'uppercase', fontWeight: 700,
+                }}>ARMED</span>
+              )}
+            </div>
+
+            {/* Stored params preview */}
+            {quickfireParams ? (
               <div style={{
-                padding: '16px', borderRadius: 8,
-                background: 'rgba(255,140,0,0.05)', border: '1px solid rgba(255,140,0,0.15)',
-                display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14,
+                background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
+                borderRadius: 6, padding: '10px 12px', marginBottom: 14,
+                display: 'flex', gap: 20, flexWrap: 'wrap',
               }}>
-                <AlertCircle size={14} color="#ff8c00" />
-                <span style={{ fontSize: 12, color: 'rgba(255,140,0,0.7)' }}>
-                  Connect a MAKCU device to enable manual control
+                {quickfireParams.target && (
+                  <div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Target</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 600 }}>
+                      ({quickfireParams.target[0]}, {quickfireParams.target[1]})
+                    </div>
+                  </div>
+                )}
+                {quickfireParams.radius !== undefined && (
+                  <div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Radius</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 600 }}>
+                      {quickfireParams.radius}px
+                    </div>
+                  </div>
+                )}
+                {quickfireParams.seed !== undefined && (
+                  <div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Seed</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 600 }}>
+                      {quickfireParams.seed}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{
+                background: 'rgba(255,140,0,0.04)', border: '1px solid rgba(255,140,0,0.12)',
+                borderRadius: 6, padding: '10px 12px', marginBottom: 14,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <AlertCircle size={13} color="rgba(255,140,0,0.6)" />
+                <span style={{ fontSize: 11, color: 'rgba(255,140,0,0.65)' }}>
+                  No quickfire params — run inference first
                 </span>
               </div>
             )}
 
-            {/* Jog speed slider */}
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                <label className="form-label" style={{ marginBottom: 0 }}>Jog Step</label>
-                <span style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#00d4ff', fontWeight: 700 }}>
-                  {jogStep}px
-                </span>
+            {/* FIRE button */}
+            <button
+              className="btn btn-primary"
+              onClick={fireQuickFire}
+              disabled={!armed || firing}
+              style={{
+                width: '100%', justifyContent: 'center',
+                fontSize: 17, fontWeight: 700,
+                padding: '14px 20px',
+                letterSpacing: '0.05em',
+                boxShadow: armed && !firing ? '0 0 20px rgba(0,212,255,0.25)' : 'none',
+              }}
+            >
+              {firing
+                ? <><span className="spinner" style={{ width: 16, height: 16 }} /> Firing…</>
+                : '⚡ FIRE'}
+            </button>
+
+            {/* Status hints */}
+            {!connected && (
+              <div style={{ fontSize: 11, color: 'rgba(255,140,0,0.7)', textAlign: 'center', marginTop: 7 }}>
+                Connect to device first
               </div>
-              <input type="range" min={1} max={100} step={1}
-                value={jogStep} onChange={e => setJogStep(Number(e.target.value))}
-                style={{ width: '100%', accentColor: '#00d4ff' }} />
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10,
-                color: 'rgba(126,200,227,0.3)', marginTop: 2 }}>
-                <span>1px (fine)</span><span>100px (coarse)</span>
+            )}
+            {connected && !quickfireParams && (
+              <div style={{ fontSize: 11, color: 'rgba(255,140,0,0.7)', textAlign: 'center', marginTop: 7 }}>
+                Run inference first on the Inference page
+              </div>
+            )}
+            {lastFiredTime && (
+              <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textAlign: 'center', marginTop: 6 }}>
+                Last fired: {lastFiredTime}
+              </div>
+            )}
+
+            {/* Configure link */}
+            <div style={{ marginTop: 12, textAlign: 'center' }}>
+              <button
+                onClick={() => navigate('/inference')}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  fontSize: 11, color: 'rgba(0,212,255,0.55)',
+                  textDecoration: 'underline', padding: 0, fontFamily: 'inherit',
+                }}
+              >
+                Configure in Inference →
+              </button>
+            </div>
+          </div>
+
+          {/* Activation Hotkey card */}
+          <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+            <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>Activation Hotkey</span>
+              {armed && (
+                <span style={{
+                  fontSize: 9, padding: '2px 7px', borderRadius: 10,
+                  background: 'rgba(57,255,20,0.12)', color: '#39ff14',
+                  border: '1px solid rgba(57,255,20,0.25)',
+                  letterSpacing: '0.1em', textTransform: 'uppercase', fontWeight: 700,
+                }}>ARMED</span>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, color: 'rgba(0,212,255,0.7)', marginBottom: 3 }}>
+                  Press this key to trigger Quick Fire globally
+                </div>
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
+                  Active when device is connected and params are loaded
+                </div>
+              </div>
+              {/* Current hotkey badge */}
+              <div style={{
+                padding: '6px 14px', borderRadius: 6,
+                background: 'rgba(0,212,255,0.08)', border: '1px solid rgba(0,212,255,0.22)',
+                fontFamily: 'JetBrains Mono', fontSize: 14, fontWeight: 700,
+                color: '#00d4ff', minWidth: 48, textAlign: 'center',
+                boxShadow: '0 0 10px rgba(0,212,255,0.08)',
+              }}>
+                {hotkeyKey}
               </div>
             </div>
 
-            {/* D-pad jog */}
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, marginBottom: 16 }}>
-              <JogBtn label="▲" onClick={() => jog(0, -jogStep)} disabled={!connected} />
-              <div style={{ display: 'flex', gap: 6 }}>
-                <JogBtn label="◀" onClick={() => jog(-jogStep, 0)} disabled={!connected} />
+            <div style={{ marginTop: 12 }}>
+              {capturingHotkey ? (
                 <div style={{
-                  width: 48, height: 48, borderRadius: 8,
-                  background: 'rgba(0,212,255,0.05)',
-                  border: '1px solid rgba(0,212,255,0.1)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  color: 'rgba(0,212,255,0.3)', fontSize: 11,
-                }}>JOG</div>
-                <JogBtn label="▶" onClick={() => jog(jogStep, 0)} disabled={!connected} />
-              </div>
-              <JogBtn label="▼" onClick={() => jog(0, jogStep)} disabled={!connected} />
-            </div>
-
-            {/* Click buttons */}
-            <div className="section-header" style={{ marginTop: 8 }}>Mouse Clicks</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {(['left', 'middle', 'right'] as const).map(btn => (
-                <button key={btn} className="btn btn-secondary"
-                  style={{ flex: 1, justifyContent: 'center', fontSize: 12 }}
-                  disabled={!connected}
-                  onClick={() => click(btn)}>
-                  {btn.charAt(0).toUpperCase() + btn.slice(1)}
+                  padding: '10px 14px', borderRadius: 6,
+                  background: 'rgba(0,212,255,0.06)', border: '1px solid rgba(0,212,255,0.3)',
+                  fontSize: 12, color: '#00d4ff', textAlign: 'center',
+                  animation: 'pulse-dot 1s ease-in-out infinite',
+                }}>
+                  Press any key… (Esc / Tab / Enter to cancel)
+                </div>
+              ) : (
+                <button
+                  className="btn btn-secondary"
+                  style={{ width: '100%', justifyContent: 'center', fontSize: 12 }}
+                  onClick={() => setCapturingHotkey(true)}
+                >
+                  Set Hotkey
                 </button>
-              ))}
+              )}
             </div>
-
-            <RawSender connected={connected} onSend={(dx, dy) => {
-              api.serial.sendSingle(dx, dy).then(r => {
-                if (r.ok) {
-                  addLog(`Sent (${dx}, ${dy})`, 'log-success')
-                  recordEvent({ type: 'move', dx, dy })
-                } else addLog(`Send failed: ${r.error}`, 'log-error')
-              })
-            }} />
           </div>
 
           {/* Macro Recorder */}
@@ -649,57 +813,7 @@ export default function Device() {
   )
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────────
-
-function JogBtn({ label, onClick, disabled }: { label: string; onClick: () => void; disabled: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      style={{
-        width: 48, height: 48, borderRadius: 8, fontSize: 18,
-        background: disabled ? 'rgba(0,212,255,0.03)' : 'rgba(0,212,255,0.08)',
-        border: `1px solid ${disabled ? 'rgba(0,212,255,0.06)' : 'rgba(0,212,255,0.2)'}`,
-        color: disabled ? 'rgba(0,212,255,0.2)' : '#00d4ff',
-        cursor: disabled ? 'not-allowed' : 'pointer',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        transition: 'all 0.15s ease',
-        boxShadow: disabled ? 'none' : '0 0 8px rgba(0,212,255,0.1)',
-      }}
-      onMouseEnter={e => !disabled && (e.currentTarget.style.boxShadow = '0 0 14px rgba(0,212,255,0.3)')}
-      onMouseLeave={e => !disabled && (e.currentTarget.style.boxShadow = '0 0 8px rgba(0,212,255,0.1)')}
-    >
-      {label}
-    </button>
-  )
-}
-
-function RawSender({ connected, onSend }: { connected: boolean; onSend: (dx: number, dy: number) => void }) {
-  const [dx, setDx] = useState('0')
-  const [dy, setDy] = useState('0')
-  return (
-    <div style={{ marginTop: 16 }}>
-      <div className="section-header" style={{ marginBottom: 8 }}>Raw Report</div>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-        <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
-          <label className="form-label">dx</label>
-          <input className="form-input" type="number" value={dx}
-            onChange={e => setDx(e.target.value)} disabled={!connected} />
-        </div>
-        <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
-          <label className="form-label">dy</label>
-          <input className="form-input" type="number" value={dy}
-            onChange={e => setDy(e.target.value)} disabled={!connected} />
-        </div>
-        <button className="btn btn-primary" disabled={!connected}
-          onClick={() => onSend(parseInt(dx) || 0, parseInt(dy) || 0)}
-          style={{ padding: '8px 14px' }}>
-          <Send size={13} />
-        </button>
-      </div>
-    </div>
-  )
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────────
 
 const codeStyle: React.CSSProperties = {
   display: 'block', marginTop: 8,

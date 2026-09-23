@@ -157,6 +157,11 @@ export default function Inference() {
         })
         setResult(res)
         setBatchResults([])
+        try {
+          localStorage.setItem('quickfire_params', JSON.stringify({
+            prefix, target, radius, progressCenter, seed: actualSeed,
+          }))
+        } catch { /* storage unavailable */ }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Inference failed')

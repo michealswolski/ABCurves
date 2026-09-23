@@ -5,13 +5,15 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts'
 import { Activity, Cpu, Zap, Shield, MousePointer2, BarChart2, Brain, Database } from 'lucide-react'
-import { api, LatencyEntry, ModelInfo } from '../services/api'
+import { api, LatencyEntry, ModelInfo, DetectionStudy, BenchmarkResult } from '../services/api'
 
 export default function Dashboard() {
   const navigate = useNavigate()
   const [serverOnline, setServerOnline] = useState<boolean | null>(null)
   const [latencies, setLatencies] = useState<LatencyEntry[]>([])
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
+  const [detection, setDetection] = useState<DetectionStudy | null>(null)
+  const [benchmarks, setBenchmarks] = useState<BenchmarkResult | null>(null)
 
   useEffect(() => {
     api.health()
@@ -20,6 +22,14 @@ export default function Dashboard() {
 
     api.modelsInfo()
       .then(info => setModelInfo(info))
+      .catch(() => {})
+
+    api.detectionStudy()
+      .then(d => setDetection(d))
+      .catch(() => {})
+
+    api.benchmarks()
+      .then(b => setBenchmarks(b))
       .catch(() => {})
 
     // Poll latency history every 5 s
@@ -106,29 +116,45 @@ export default function Dashboard() {
         />
         <StatCard
           title="Cold Detection"
-          value="0 / 1280"
+          value={detection
+            ? `${detection.cold_test.caught} / ${detection.cold_test.total}`
+            : '—'}
           subtitle="Undetected in cold tests"
           icon={<Shield size={20} />}
           accent="#39ff14"
-          trend={{ direction: 'down', label: '0% catch rate' }}
+          trend={detection
+            ? { direction: 'down', label: `${(detection.cold_test.detection_rate * 100).toFixed(0)}% catch rate` }
+            : undefined}
         />
         <StatCard
           title="Texture Distance"
-          value="0.263"
-          subtitle="Inside human range"
+          value={detection
+            ? detection.texture_distances.renderer_output.toFixed(3)
+            : '—'}
+          subtitle={detection ? 'Inside human range' : 'Loading…'}
           icon={<Activity size={20} />}
           accent="#b44aff"
-          trend={{ direction: 'down', label: 'Human avg: 0.639' }}
+          trend={detection
+            ? { direction: 'down', label: `Human avg: ${detection.texture_distances.average_different_person.toFixed(3)}` }
+            : undefined}
         />
         <StatCard
-          title={latencies.length > 0 ? `Last: ${latencies[latencies.length - 1].ms}ms` : 'P50 Latency'}
+          title={latencies.length > 0 ? 'Avg Latency' : 'P50 Latency'}
           value={latencies.length > 0
             ? `${(latencies.reduce((s, e) => s + e.ms, 0) / latencies.length).toFixed(0)}ms`
-            : '0.24ms'}
-          subtitle={latencies.length > 0 ? `avg over ${latencies.length} runs` : 'Profile path, warmed'}
+            : (() => {
+                const us = (benchmarks as any)?.b_to_stream_ready_us?.p50
+                return us != null ? `${(us / 1000).toFixed(3)}ms` : '—'
+              })()}
+          subtitle={latencies.length > 0 ? `avg over ${latencies.length} runs` : 'Benchmark (no runs yet)'}
           icon={<Zap size={20} />}
           accent="#ff8c00"
-          trend={{ direction: 'neutral', label: latencies.length > 0 ? `last: ${latencies[latencies.length - 1].ms}ms` : 'p99: 0.43ms' }}
+          trend={latencies.length > 0
+            ? { direction: 'neutral', label: `last: ${latencies[latencies.length - 1].ms}ms` }
+            : (() => {
+                const us = (benchmarks as any)?.b_to_stream_ready_us?.p99
+                return us != null ? { direction: 'neutral' as const, label: `p99: ${(us / 1000).toFixed(3)}ms` } : undefined
+              })()}
         />
       </div>
 
@@ -232,7 +258,7 @@ export default function Dashboard() {
                 ['Planner Heads',  '16 ProDMP heads',   '#b44aff'],
                 ['Renderer',       'GRU + δ-σ accum.',  '#39ff14'],
                 ['Output Rate',    '1 kHz (1 ms/report)','#ff8c00'],
-                ['Cold Detection', '0 / 1,280 caught',  '#39ff14'],
+                ['Cold Detection', detection ? `${detection.cold_test.caught} / ${detection.cold_test.total} caught` : '—', '#39ff14'],
                 ['License',        'MIT Open Source',   '#00d4ff'],
               ].map(([k, v, c]) => (
                 <div key={k} style={{
