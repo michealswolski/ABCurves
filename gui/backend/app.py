@@ -220,8 +220,11 @@ def warmup():
     try:
         np.random.seed(0)
         prefix = np.random.randn(20, 2).astype(np.float32) * 3
+        raw_profile = np.random.randint(-10, 10, (256, 2)).astype(np.int16)
+        renderer_profile = pipeline.prepare_renderer_profile(raw_profile)
         t0 = time.time()
-        pipeline.generate(prefix, target_rel_at_B=(50, 0), target_radius=10, progress_center=0.5, seed=1)
+        pipeline.generate(prefix, renderer_profile=renderer_profile,
+                          target_rel_at_B=(50, 0), target_radius=10, progress_center=0.5, seed=1)
         ms = round((time.time() - t0) * 1000, 1)
         return jsonify({'ok': True, 'latency_ms': ms})
     except Exception as exc:
