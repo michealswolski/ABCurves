@@ -68,8 +68,26 @@ export default function Device() {
   const [detRcs, setDetRcs]               = useState(0)
   const [detVelocity, setDetVelocity]     = useState<[number,number]|null>(null)
   const [detTarget, setDetTarget]         = useState(false)
-  const [detDpi, setDetDpi]               = useState(400)
-  const [detSens, setDetSens]             = useState(3.26)
+  const [detError, setDetError]           = useState<string | null>(null)
+  const detTargetTimer                    = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Load DPI/sensitivity from the Settings fov_config if available
+  const [detDpi, setDetDpi]               = useState(() => {
+    try { return JSON.parse(localStorage.getItem('fov_config') || 'null')?.dpi ?? 400 } catch { return 400 }
+  })
+  const [detSens, setDetSens]             = useState(() => {
+    try { return JSON.parse(localStorage.getItem('fov_config') || 'null')?.sensitivity ?? 3.2554 } catch { return 3.2554 }
+  })
+  const [detFovDist, setDetFovDist]       = useState(0)
+  const [detNextDelay, setDetNextDelay]   = useState(0)
+  const [detJitter, setDetJitter]         = useState(0)
+  const [detPriority, setDetPriority]     = useState<'nearest'|'largest'|'confidence'>('nearest')
+  const [detAutoClick, setDetAutoClick]   = useState(false)
+  const [detMonitor, setDetMonitor]       = useState(0)
+  const [detMonitors, setDetMonitors]     = useState<Array<{index: number; label: string; primary: boolean}>>([])
+  const [detPresets, setDetPresets]       = useState<Record<string, any>>(() => {
+    try { return JSON.parse(localStorage.getItem('det_presets') || '{}') } catch { return {} }
+  })
+  const [presetName, setPresetName]       = useState('')
 
   // Triggerbot state (synced from Settings)
   const [triggerEnabled, setTriggerEnabled] = useState(() =>
@@ -141,12 +159,24 @@ export default function Device() {
               setReplayingMacro(false)
               if (data.ok) addLog(`✓ Macro replayed: ${data.events_replayed} events`, 'log-success')
               else addLog(`✗ Macro errors: ${data.errors}`, 'log-error')
+            } else if (event === 'detection_update') {
+              // Real-time target lock — auto-clears 200ms after last detection event
+              setDetTarget(true)
+              if (data.vx !== undefined && data.vy !== undefined) setDetVelocity([data.vx, data.vy])
+              if (detTargetTimer.current) clearTimeout(detTargetTimer.current)
+              detTargetTimer.current = setTimeout(() => {
+                setDetTarget(false)
+                setDetVelocity(null)
+              }, 200)
             }
           } catch { /* ignore parse errors */ }
         }
       }
     } catch { /* WebSocket optional */ }
-    return () => { sock?.close() }
+    return () => {
+      if (detTargetTimer.current) clearTimeout(detTargetTimer.current)
+      sock?.close()
+    }
   }, [addLog])
 
   const scanPorts = useCallback(async () => {
@@ -176,6 +206,11 @@ export default function Device() {
 
   // Initial scan + status
   useEffect(() => { scanPorts(); refreshStatus() }, [])
+
+  // Load available monitors once on mount
+  useEffect(() => {
+    api.detection.monitors().then(r => setDetMonitors(r.monitors)).catch(() => {})
+  }, [])
 
   // Auto-reconnect polling
   useEffect(() => {
@@ -300,13 +335,26 @@ export default function Device() {
         const s = await api.detection.status()
         setDetFps(s.fps)
         setDetHits(s.hits)
-        setDetVelocity(s.velocity ?? null)
-        setDetTarget(!!(s.last_px))
+        // Don't update detTarget/velocity from poll — WS events own those with 200ms auto-clear.
+        // The poll sets them to false only when detection fully stops.
         if (!s.running) {
           setDetRunning(false)
           setDetVelocity(null)
           setDetTarget(false)
-          addLog('Auto-detect stopped', 'log-warn')
+          // Check if detection crashed rather than stopped cleanly
+          try {
+            const errResp = await fetch('/api/detection/last-error')
+            const errData = await errResp.json()
+            if (errData.error) {
+              setDetError(errData.error)
+              addLog(`Detection crashed: ${errData.error}`, 'log-error')
+            } else {
+              setDetError(null)
+              addLog('Auto-detect stopped', 'log-warn')
+            }
+          } catch {
+            addLog('Auto-detect stopped', 'log-warn')
+          }
         }
       } catch {}
     }, 500)
@@ -317,22 +365,38 @@ export default function Device() {
     if (detRunning) {
       try { await api.detection.stop() } catch {}
       setDetRunning(false)
+      setDetError(null)
       addLog('Auto-detect stopped', 'log-warn')
       return
     }
+    setDetError(null)
     setDetStarting(true)
     const classList = detClasses.split(',').map(s => s.trim()).filter(Boolean)
     addLog(`Starting auto-detect [${detMode.toUpperCase()}] for: ${classList.join(', ')} (conf ${Math.round(detConfidence * 100)}%)…`, 'log-dim')
     try {
+      // Parse fov_config once — merge live DPI/sens with stored fovH/screenW
+      let fovCfg: { dpi: number; sensitivity: number; fovH: number; screenW: number }
+      try {
+        const s = JSON.parse(localStorage.getItem('fov_config') || 'null') ?? {}
+        fovCfg = { dpi: detDpi, sensitivity: detSens, fovH: s.fovH ?? 106.26, screenW: s.screenW ?? 2560 }
+      } catch {
+        fovCfg = { dpi: detDpi, sensitivity: detSens, fovH: 106.26, screenW: 2560 }
+      }
       const r = await api.detection.start({
-        classes:      classList,
-        mode:         detMode,
-        confidence:   detConfidence,
-        cooldown_ms:  detCooldown,
-        fov_config:   { dpi: detDpi, sensitivity: detSens, fovH: 106.26, screenW: 2560 },
-        aim_height:   detAimHeight,
-        lead_ms:      (detMode === 'snap' || detMode === 'flick') ? 0 : detLeadMs,
-        rcs_strength: detRcs / 100,
+        classes:              classList,
+        mode:                 detMode,
+        confidence:           detConfidence,
+        cooldown_ms:          detCooldown,
+        fov_config:           fovCfg,
+        aim_height:           detAimHeight,
+        lead_ms:              (detMode === 'snap' || detMode === 'flick') ? 0 : detLeadMs,
+        rcs_strength:         detRcs / 100,
+        fov_distance:         detFovDist > 0 ? detFovDist : undefined,
+        next_target_delay_ms: detNextDelay > 0 ? detNextDelay : undefined,
+        jitter_ms:            detJitter > 0 ? detJitter : undefined,
+        target_priority:      detPriority,
+        auto_click:           detAutoClick,
+        monitor_index:        detMonitor,
       })
       if (r.ok) {
         setDetRunning(true)
@@ -340,14 +404,18 @@ export default function Device() {
         addLog(`✓ Auto-detect [${r.mode?.toUpperCase()}] running — ${r.classes?.join(', ')}`, 'log-success')
         addLog('YOLO-World zero-shot: no training needed. First run ~100MB download.', 'log-dim')
       } else {
+        setDetError(r.error ?? 'Detection failed to start')
         addLog(`Auto-detect error: ${r.error}`, 'log-error')
       }
     } catch (e) {
+      setDetError(String(e))
       addLog(`Auto-detect failed: ${e}`, 'log-error')
     } finally {
       setDetStarting(false)
     }
-  }, [detRunning, detClasses, detConfidence, detCooldown, detMode, detAimHeight, detLeadMs, detRcs, detDpi, detSens, addLog])
+  }, [detRunning, detClasses, detConfidence, detCooldown, detMode, detAimHeight, detLeadMs, detRcs, detDpi, detSens, detFovDist, detNextDelay, detJitter, detPriority, detAutoClick, detMonitor, addLog])
+  // Note: savedFov reads fovH/screenW from localStorage inline, so those values
+  // are always current at the time detection starts without needing extra state.
 
   // Load default quickfire params from example data
   const [loadingDefault, setLoadingDefault] = useState(false)
@@ -373,6 +441,33 @@ export default function Device() {
       setLoadingDefault(false)
     }
   }, [addLog])
+
+  const savePreset = useCallback(() => {
+    if (!presetName.trim()) return
+    const p = { mode: detMode, confidence: detConfidence, cooldown: detCooldown, aimHeight: detAimHeight, leadMs: detLeadMs, rcs: detRcs, fovDist: detFovDist, nextDelay: detNextDelay, jitter: detJitter, priority: detPriority, classes: detClasses, dpi: detDpi, sens: detSens, autoClick: detAutoClick }
+    const updated = { ...detPresets, [presetName.trim()]: p }
+    localStorage.setItem('det_presets', JSON.stringify(updated))
+    setDetPresets(updated)
+    setPresetName('')
+    addLog(`Saved preset "${presetName.trim()}"`, 'log-success')
+  }, [presetName, detMode, detConfidence, detCooldown, detAimHeight, detLeadMs, detRcs, detFovDist, detNextDelay, detJitter, detPriority, detClasses, detDpi, detSens, detAutoClick, detPresets, addLog])
+
+  const loadPreset = useCallback((name: string) => {
+    const p = detPresets[name]; if (!p) return
+    setDetMode(p.mode); setDetConfidence(p.confidence); setDetCooldown(p.cooldown)
+    setDetAimHeight(p.aimHeight); setDetLeadMs(p.leadMs ?? 0); setDetRcs(p.rcs ?? 0)
+    setDetFovDist(p.fovDist ?? 0); setDetNextDelay(p.nextDelay ?? 0); setDetJitter(p.jitter ?? 0)
+    setDetPriority(p.priority ?? 'nearest'); setDetClasses(p.classes ?? 'person, head')
+    setDetDpi(p.dpi ?? 400); setDetSens(p.sens ?? 3.2554)
+    if (p.autoClick !== undefined) setDetAutoClick(p.autoClick)
+    addLog(`Loaded preset "${name}"`, 'log-success')
+  }, [detPresets, addLog])
+
+  const deletePreset = useCallback((name: string) => {
+    const updated = { ...detPresets }; delete updated[name]
+    localStorage.setItem('det_presets', JSON.stringify(updated))
+    setDetPresets(updated)
+  }, [detPresets])
 
   // Quick Fire action
   const fireQuickFire = useCallback(async () => {
@@ -1018,6 +1113,16 @@ export default function Device() {
                   animation: 'pulse-dot 1s ease-in-out infinite',
                 }}>LIVE</span>
               )}
+              <button
+                onClick={() => window.open('/overlay', 'abcurves-hud', 'width=300,height=185,resizable=yes')}
+                title="Open floating HUD overlay"
+                style={{
+                  marginLeft: 'auto', fontSize: 10, padding: '2px 8px', borderRadius: 4,
+                  background: 'rgba(0,212,255,0.06)', border: '1px solid rgba(0,212,255,0.18)',
+                  color: 'rgba(0,212,255,0.55)', cursor: 'pointer', fontFamily: 'inherit',
+                }}>
+                ⛶ HUD
+              </button>
             </div>
 
             {/* Live stats bar */}
@@ -1169,6 +1274,106 @@ export default function Device() {
               </div>
             )}
 
+            {/* FOV Distance + Target Priority */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label" style={{ color: detFovDist > 0 ? '#00d4ff' : undefined }}>
+                  FOV Radius {detFovDist > 0 ? `(${detFovDist}px)` : '(auto)'}
+                </label>
+                <input type="range" min={0} max={640} step={10} value={detFovDist}
+                  onChange={e => setDetFovDist(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%' }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textAlign: 'center' }}>
+                  {detFovDist === 0 ? `Auto (${detMode === 'flick' ? 150 : detMode === 'snap' ? 200 : detMode === 'track' ? 280 : 320}px for ${detMode})` : 'Custom target window'}
+                </div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="form-label">Target Priority</label>
+                <div style={{ display: 'flex', gap: 3, marginTop: 2 }}>
+                  {(['nearest', 'largest', 'confidence'] as const).map(p => (
+                    <button key={p} onClick={() => { if (!detRunning) setDetPriority(p) }} disabled={detRunning}
+                      style={{
+                        flex: 1, padding: '4px 2px', fontSize: 9, fontWeight: 700,
+                        letterSpacing: '0.04em', textTransform: 'uppercase',
+                        border: `1px solid ${detPriority === p ? '#00d4ff44' : 'rgba(126,200,227,0.12)'}`,
+                        borderRadius: 4, background: detPriority === p ? 'rgba(0,212,255,0.1)' : 'transparent',
+                        color: detPriority === p ? '#00d4ff' : 'rgba(126,200,227,0.4)',
+                        cursor: detRunning ? 'default' : 'pointer', transition: 'all 0.15s',
+                      }}>{p === 'confidence' ? 'conf' : p}</button>
+                  ))}
+                </div>
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', marginTop: 3, textAlign: 'center' }}>
+                  {detPriority === 'nearest' ? 'Closest to crosshair' : detPriority === 'largest' ? 'Biggest hitbox' : 'Highest confidence'}
+                </div>
+              </div>
+            </div>
+
+            {/* Next-Target Delay + Jitter */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+              <div style={{ flex: 1 }}>
+                <label className="form-label" style={{ color: detNextDelay > 0 ? '#ff8c00' : undefined }}>
+                  Next-Target Delay {detNextDelay > 0 ? `(${detNextDelay}ms)` : '(off)'}
+                </label>
+                <input type="range" min={0} max={500} step={25} value={detNextDelay}
+                  onChange={e => setDetNextDelay(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%', accentColor: detNextDelay > 0 ? '#ff8c00' : undefined }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textAlign: 'center' }}>
+                  {detNextDelay === 0 ? 'Instant re-acquire' : `Wait ${detNextDelay}ms after losing target`}
+                </div>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label className="form-label" style={{ color: detJitter > 0 ? '#39ff14' : undefined }}>
+                  Reaction Jitter {detJitter > 0 ? `(0–${detJitter}ms)` : '(off)'}
+                </label>
+                <input type="range" min={0} max={100} step={5} value={detJitter}
+                  onChange={e => setDetJitter(Number(e.target.value))} disabled={detRunning}
+                  style={{ width: '100%', accentColor: detJitter > 0 ? '#39ff14' : undefined }} />
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', textAlign: 'center' }}>
+                  {detJitter === 0 ? 'Instant fire' : `Random delay — humanizes timing`}
+                </div>
+              </div>
+            </div>
+
+            {/* Auto-click + Monitor */}
+            <div style={{ display: 'flex', gap: 10, marginBottom: 10 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
+                  <label className="form-label" style={{ color: detAutoClick ? '#ff2d78' : undefined, marginBottom: 0 }}>
+                    Auto-Click {detAutoClick ? '(ON)' : '(off)'}
+                  </label>
+                  <button onClick={() => { if (!detRunning) setDetAutoClick(v => !v) }} disabled={detRunning}
+                    style={{
+                      width: 36, height: 20, borderRadius: 10,
+                      background: detAutoClick ? 'rgba(255,45,120,0.2)' : 'rgba(0,212,255,0.06)',
+                      border: `1px solid ${detAutoClick ? 'rgba(255,45,120,0.4)' : 'rgba(0,212,255,0.12)'}`,
+                      cursor: detRunning ? 'default' : 'pointer', position: 'relative', transition: 'all 0.2s',
+                    }}>
+                    <div style={{
+                      width: 12, height: 12, borderRadius: '50%',
+                      background: detAutoClick ? '#ff2d78' : 'rgba(126,200,227,0.3)',
+                      position: 'absolute', top: 3, left: detAutoClick ? 20 : 3,
+                      transition: 'all 0.2s', boxShadow: detAutoClick ? '0 0 6px #ff2d78' : 'none',
+                    }} />
+                  </button>
+                </div>
+                <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
+                  {detAutoClick ? 'Fires click after aim TX' : 'Aim only — no click'}
+                </div>
+              </div>
+              {detMonitors.length > 0 && (
+                <div style={{ flex: 1 }}>
+                  <label className="form-label">Capture Monitor</label>
+                  <select className="form-input" style={{ fontSize: 11, padding: '4px 8px' }}
+                    value={detMonitor} onChange={e => { if (!detRunning) setDetMonitor(Number(e.target.value)) }}
+                    disabled={detRunning}>
+                    {detMonitors.map(m => (
+                      <option key={m.index} value={m.index}>{m.label}{m.primary ? ' ★' : ''}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+
             <button
               className="btn btn-primary"
               onClick={toggleDetection}
@@ -1191,9 +1396,79 @@ export default function Device() {
                 Connect MAKCU first
               </div>
             )}
+            {detError && (
+              <div style={{
+                marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                background: 'rgba(255,45,80,0.12)', border: '1px solid rgba(255,45,80,0.35)',
+                fontSize: 11, color: '#ff4d6d', display: 'flex', alignItems: 'flex-start', gap: 6,
+              }}>
+                <span style={{ flexShrink: 0, marginTop: 1 }}>⚠</span>
+                <span style={{ flex: 1, wordBreak: 'break-all' }}>{detError}</span>
+                <button onClick={() => setDetError(null)} style={{
+                  background: 'none', border: 'none', color: '#ff4d6d', cursor: 'pointer',
+                  fontSize: 13, lineHeight: 1, padding: 0, flexShrink: 0,
+                }}>✕</button>
+              </div>
+            )}
             <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.2)', textAlign: 'center', marginTop: 6 }}>
               Center 640×640px · YOLO-World GPU · IOU 0.4 · dxcam
             </div>
+          </div>
+
+          {/* Detection Presets */}
+          <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+            <div className="section-header">Detection Presets</div>
+
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+              <input
+                className="form-input"
+                placeholder="Preset name (e.g. Valorant)"
+                style={{ flex: 1, fontSize: 12 }}
+                value={presetName}
+                onChange={e => setPresetName(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') savePreset() }}
+                disabled={detRunning}
+              />
+              <button className="btn btn-secondary" onClick={savePreset}
+                disabled={detRunning || !presetName.trim()}
+                style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                + Save
+              </button>
+            </div>
+
+            {Object.keys(detPresets).length === 0 ? (
+              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.25)', textAlign: 'center', padding: '6px 0' }}>
+                No saved presets — type a name above and click Save
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {Object.keys(detPresets).map(name => (
+                  <div key={name} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    padding: '7px 10px', borderRadius: 6,
+                    background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
+                  }}>
+                    <div style={{ flex: 1, fontSize: 12, color: '#00d4ff', fontWeight: 600 }}>{name}</div>
+                    <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.4)', marginRight: 4 }}>
+                      {detPresets[name].mode?.toUpperCase()} · conf {Math.round((detPresets[name].confidence ?? 0.25) * 100)}%
+                      {detPresets[name].autoClick ? ' · click' : ''}
+                    </div>
+                    <button onClick={() => loadPreset(name)} disabled={detRunning}
+                      style={{
+                        fontSize: 11, padding: '3px 8px', borderRadius: 4,
+                        background: 'rgba(57,255,20,0.08)', border: '1px solid rgba(57,255,20,0.2)',
+                        color: '#39ff14', cursor: detRunning ? 'default' : 'pointer',
+                      }}>Load</button>
+                    <button onClick={() => deletePreset(name)}
+                      style={{
+                        fontSize: 11, padding: '3px 6px', borderRadius: 4,
+                        background: 'rgba(255,45,80,0.08)', border: '1px solid rgba(255,45,80,0.15)',
+                        color: 'rgba(255,45,80,0.6)', cursor: 'pointer',
+                      }}>✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Macro Recorder */}

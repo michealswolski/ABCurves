@@ -193,6 +193,12 @@ export const api = {
       rcs_strength?: number
       target_radius?: number
       progress_center?: number
+      fov_distance?: number
+      next_target_delay_ms?: number
+      jitter_ms?: number
+      target_priority?: 'nearest' | 'largest' | 'confidence'
+      auto_click?: boolean
+      monitor_index?: number
     }) => post<{ ok: boolean; classes?: string[]; mode?: string; error?: string }>('/detection/start', opts),
     stop:   () => post<{ ok: boolean }>('/detection/stop'),
     status: () => get<{
@@ -204,7 +210,8 @@ export const api = {
       mode: string
       config: Record<string, number | string>
     }>('/detection/status'),
-    modes:  () => get<Record<string, { max_movement_ms: number; cooldown_ms: number; aim_height: number; desc: string }>>('/detection/modes'),
+    modes:    () => get<Record<string, { max_movement_ms: number; cooldown_ms: number; aim_height: number; desc: string }>>('/detection/modes'),
+    monitors: () => get<{ monitors: Array<{ index: number; label: string; primary: boolean; width: number; height: number }> }>('/detection/monitors'),
   },
 
   // Results

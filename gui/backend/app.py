@@ -5,6 +5,7 @@ import math
 import time
 import threading
 import numpy as np
+from collections import deque
 from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -25,8 +26,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # ── Singletons ────────────────────────────────────────────────────────────────
 serial_mgr = SerialManager()
 pipeline = None
-inference_history: list[dict] = []
-latency_history: list[dict] = []   # rolling last 100 inference latencies
+inference_history: deque = deque(maxlen=200)
+latency_history: deque = deque(maxlen=100)
 training_logs: list[dict] = []
 
 
@@ -76,7 +77,7 @@ def get_models():
 @app.route('/api/inference', methods=['POST'])
 def run_inference():
     try:
-        data = request.json
+        data = request.json or {}
         if not data.get('prefix'):
             return jsonify({'error': 'No prefix data provided'}), 400
 
@@ -85,6 +86,8 @@ def run_inference():
             return jsonify({'error': 'Prefix must have shape (N, 2)'}), 400
         if len(prefix) < 10:
             return jsonify({'error': 'Prefix too short (minimum 10 samples)'}), 400
+        if len(prefix) > 4096:
+            return jsonify({'error': 'Prefix too long (maximum 4096 samples)'}), 400
 
         target_rel   = tuple(data.get('target', [100, 0]))
         target_radius = float(data.get('target_radius', 18.0))
@@ -123,8 +126,6 @@ def run_inference():
         }
         inference_history.append(entry)
         latency_history.append({'t': entry['timestamp'], 'ms': latency_ms})
-        if len(latency_history) > 100:
-            latency_history.pop(0)
         return jsonify({
             'success': True,
             'continuation': counts.tolist(),
@@ -144,13 +145,14 @@ def run_inference():
 @app.route('/api/inference-history')
 def get_inference_history():
     limit = request.args.get('limit', 10, type=int)
-    return jsonify({'count': len(inference_history), 'history': inference_history[-limit:]})
+    hist = list(inference_history)
+    return jsonify({'count': len(hist), 'history': hist[-limit:]})
 
 
 @app.route('/api/inference/latency-history')
 def inference_latency_history():
     limit = request.args.get('limit', 50, type=int)
-    return jsonify({'history': latency_history[-limit:]})
+    return jsonify({'history': list(latency_history)[-limit:]})
 
 
 @app.route('/api/inference/batch', methods=['POST'])
@@ -247,15 +249,19 @@ def push_target():
     if fov_config:
         dpi, sens = float(fov_config['dpi']), float(fov_config['sensitivity'])
         fovH, screenW = float(fov_config['fovH']), float(fov_config['screenW'])
-        cpp = (dpi / 400) / (sens * 0.022) * (fovH / screenW)
     else:
-        # Default CS2 @ 400 DPI, 3.2554 sens, 106.26 FOV, 2560 wide
-        cpp = (400 / 400) / (3.2554 * 0.022) * (106.26 / 2560)
+        dpi, sens, fovH, screenW = 400.0, 3.2554, 106.26, 2560.0
+    cpp = _px_to_cpp(dpi, sens, fovH, screenW)
     cx = round(px_x * cpp)
     cy = round(px_y * cpp)
     _live_target = {'x': cx, 'y': cy, 'px_x': px_x, 'px_y': px_y}
     socketio.emit('target_update', _live_target)
     return jsonify({'ok': True, 'counts': [cx, cy]})
+
+
+def _px_to_cpp(dpi: float, sens: float, fovH: float, screen_w: float) -> float:
+    """Counts-per-pixel: converts screen pixels to MAKCU mouse counts."""
+    return (dpi / 400) / (sens * 0.022) * (fovH / screen_w)
 
 
 # ── AIM MODE PRESETS ─────────────────────────────────────────────────────────
@@ -332,8 +338,14 @@ def _run_detection(
     rcs_strength: float,
     target_radius: float,
     progress_center: float,
+    fov_distance: float = 0.0,
+    next_target_delay_ms: float = 0.0,
+    jitter_ms: float = 0.0,
+    target_priority: str = 'nearest',
+    auto_click: bool = False,
+    monitor_index: int = 0,
 ):
-    from collections import deque
+    import random as _random
 
     try:
         import torch
@@ -351,6 +363,7 @@ def _run_detection(
     logger.info("Detection device: %s%s  mode=%s", device.upper(), " (FP16)" if use_fp16 else "", mode)
 
     logger.info("Loading YOLO-World…")
+    model = None
     try:
         model = YOLOWorld('yolov8s-worldv2.pt')
         model.set_classes(classes)
@@ -360,6 +373,13 @@ def _run_detection(
     except Exception as exc:
         msg = f"YOLO-World load failed: {exc}"
         logger.error(msg)
+        if model is not None:
+            try:
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         with _det_lock:
             _det_state['running'] = False
             _det_state['last_error'] = msg
@@ -400,17 +420,26 @@ def _run_detection(
         sw   = float(fov_config.get('screenW', 2560))
     else:
         dpi, sens, fovH, sw = 400.0, 3.2554, 106.26, 2560.0
-    cpp = (dpi / 400) / (sens * 0.022) * (fovH / sw)
+    cpp = _px_to_cpp(dpi, sens, fovH, sw)
 
-    max_reps     = math.ceil(max_movement_ms / max(interval_ms, 0.5))
+    # Use the same 1ms floor as SerialManager so report count matches actual TX duration.
+    # Using the raw interval_ms (e.g. 0.5 for flick) would compute 2× too many reports,
+    # and since SerialManager clamps to 1ms the stream would take 2× the declared travel time.
+    effective_interval = max(interval_ms, 1.0)
+    max_reps = math.ceil(max_movement_ms / effective_interval)
     last_fire      = 0.0
-    frame_ts:  list  = []
+    frame_ts:  deque = deque(maxlen=30)
     pos_history: deque = deque(maxlen=8)   # (time, px_x, px_y)
     crop           = 640
-    miss_frames    = 0       # consecutive frames with no detection
-    last_known_px  = None    # carry last position across up to 3 missed frames
-    MAX_MISS       = 3       # frames of persistence before dropping target
-    MAX_AIM_DIST   = 280.0   # ignore detections farther than this from crop center
+    miss_frames       = 0      # consecutive frames with no detection
+    acq_frames        = 0      # consecutive frames with a valid detection (hysteresis)
+    last_known_px     = None   # carry last position across up to 3 missed frames
+    last_target_drop  = 0.0    # time when target was last fully dropped
+    MAX_MISS          = 3      # frames of persistence before dropping target
+    ACQ_THRESHOLD     = 2      # consecutive frames required before firing
+    # Effective FOV distance: use caller-supplied value or fallback to per-mode default
+    _DEFAULT_FOV_DIST = {'flick': 150.0, 'snap': 200.0, 'track': 280.0, 'smooth': 320.0}
+    MAX_AIM_DIST      = fov_distance if fov_distance > 0 else _DEFAULT_FOV_DIST.get(mode, 280.0)
 
     # per-mode EMA alpha: snap/flick pass through raw; track/smooth blend positions
     _SMOOTH_ALPHA = {'flick': 1.0, 'snap': 1.0, 'track': 0.72, 'smooth': 0.50}
@@ -423,27 +452,46 @@ def _run_detection(
 
     # ── inner frame processor — shared by dxcam + mss paths ───────────────────
     def process_frame(frame: np.ndarray, cx_rel: int, cy_rel: int) -> None:
-        nonlocal last_fire, miss_frames, last_known_px, smoothed_px
+        nonlocal last_fire, miss_frames, acq_frames, last_known_px, smoothed_px, last_target_drop
         import torch as _torch
+
+        # Capture timestamp before inference so velocity dt reflects capture cadence,
+        # not inference latency (which varies frame-to-frame under GPU load).
+        now = time.time()
 
         with _torch.no_grad():
             results = model(frame, conf=confidence, iou=0.4, verbose=False)[0]
 
-        boxes     = results.boxes
-        best_px, best_dist = None, float('inf')
+        boxes = results.boxes
+        best_px, best_dist, best_score = None, float('inf'), float('-inf')
         if boxes is not None and len(boxes):
-            for box in boxes.xyxy.cpu().numpy():
+            xyxy  = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            for box, bconf in zip(xyxy, confs):
                 bx   = (box[0] + box[2]) / 2
                 by   = box[1] + (box[3] - box[1]) * aim_height
                 dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
-                if dist < best_dist and dist <= MAX_AIM_DIST:
-                    best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
-
-        now = time.time()
+                if dist > MAX_AIM_DIST:
+                    continue
+                # Score according to priority mode
+                if target_priority == 'confidence':
+                    score = float(bconf)
+                elif target_priority == 'largest':
+                    score = (box[2] - box[0]) * (box[3] - box[1])
+                else:  # 'nearest' (default)
+                    score = -dist
+                if score > best_score:
+                    best_score, best_dist, best_px = score, dist, (bx - cx_rel, by - cy_rel)
 
         if best_px:
             px_x, px_y   = best_px
             miss_frames  = 0
+            # Respect next-target delay: don't count new target acq until lockout expires
+            delay_ok = (next_target_delay_ms <= 0 or
+                        last_target_drop == 0.0 or
+                        (now - last_target_drop) * 1000 >= next_target_delay_ms)
+            if delay_ok:
+                acq_frames = min(acq_frames + 1, ACQ_THRESHOLD)
             last_known_px = best_px
 
             # EMA smoothing: snap/flick pass through raw; track/smooth blend
@@ -484,7 +532,7 @@ def _run_detection(
 
             with tx_lock:
                 _can_fire = not tx_state['firing']
-            if _can_fire and (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+            if _can_fire and acq_frames >= ACQ_THRESHOLD and (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
                 cx_c = round(px_x * cpp)
                 cy_c = round(px_y * cpp)
                 try:
@@ -501,20 +549,30 @@ def _run_detection(
                     if reports:
                         with tx_lock:
                             tx_state['firing'] = True
-                        last_fire = now
-                        with _det_lock:
-                            _det_state['hits'] += 1
 
-                        # Non-blocking TX: run serial write in daemon thread so detection
-                        # loop can keep capturing frames during the movement interval
-                        def _fire_async(rpts=reports, itv=interval_ms, rcs=rcs_strength, mvt=max_movement_ms):
+                        # Non-blocking TX: concatenate aim + recoil into one report stream
+                        # so the combined output never exceeds the device poll rate (1 kHz).
+                        # Sending them as separate serial writes would stack their rates.
+                        # last_fire is set inside the thread AFTER jitter so cooldown
+                        # is measured from when the packet actually leaves the port.
+                        def _fire_async(rpts=reports, itv=interval_ms, rcs=rcs_strength,
+                                        jit=jitter_ms, do_click=auto_click):
+                            nonlocal last_fire
                             try:
-                                serial_mgr.send_reports(rpts, itv, on_progress=lambda s, t: None)
-                                if rcs > 0:
-                                    rcs_counts = round(4.0 * rcs)
-                                    if rcs_counts > 0:
-                                        time.sleep(mvt / 1000.0 * 0.8)
-                                        serial_mgr.send_single(0, rcs_counts)
+                                if jit > 0:
+                                    time.sleep(_random.uniform(0, jit / 1000.0))
+                                last_fire = time.time()
+                                combined = list(rpts)
+                                rcs_counts = round(4.0 * rcs)
+                                if rcs_counts > 0:
+                                    combined.append([0, rcs_counts])
+                                serial_mgr.send_reports(combined, itv, on_progress=lambda s, t: None)
+                                if do_click:
+                                    serial_mgr.click('left')
+                                with _det_lock:
+                                    _det_state['hits'] += 1
+                            except Exception as _exc:
+                                logger.warning("Auto-fire TX error: %s", _exc)
                             finally:
                                 with tx_lock:
                                     tx_state['firing'] = False
@@ -530,7 +588,10 @@ def _run_detection(
                 # Hold last known position briefly — smooths 1-2 frame dropouts
                 pass
             else:
+                if last_known_px is not None:
+                    last_target_drop = now  # record when we lose the target
                 miss_frames   = 0
+                acq_frames    = 0
                 last_known_px = None
                 smoothed_px   = None
                 with _det_lock:
@@ -546,21 +607,22 @@ def _run_detection(
                 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # physical pixels
             except Exception:
                 pass
-            mw = ctypes.windll.user32.GetSystemMetrics(0)
-            mh = ctypes.windll.user32.GetSystemMetrics(1)
-            region = (mw // 2 - crop // 2, mh // 2 - crop // 2,
-                      mw // 2 + crop // 2, mh // 2 + crop // 2)
-            cx_rel = cy_rel = crop // 2
-            cam = _dxcam.create(output_color="BGR")
             import mss as _mss_seed
             with _mss_seed.MSS() as _sct:
-                _mon = _sct.monitors[1]
+                _mons = _sct.monitors
+                _mon  = _mons[min(monitor_index + 1, len(_mons) - 1)]
+                _ml, _mt = _mon['left'], _mon['top']
+                _mw, _mh = _mon['width'], _mon['height']
+                region = (_ml + _mw // 2 - crop // 2, _mt + _mh // 2 - crop // 2,
+                          _ml + _mw // 2 + crop // 2, _mt + _mh // 2 + crop // 2)
+                cx_rel = cy_rel = crop // 2
                 _seed_cap = {
-                    'left': _mon['left'] + mw // 2 - crop // 2,
-                    'top':  _mon['top']  + mh // 2 - crop // 2,
+                    'left': _ml + _mw // 2 - crop // 2,
+                    'top':  _mt + _mh // 2 - crop // 2,
                     'width': crop, 'height': crop,
                 }
                 last_frame = np.array(_sct.grab(_seed_cap))[:, :, :3]
+            cam = _dxcam.create(output_color="BGR")
 
             while True:
                 with _det_lock:
@@ -574,8 +636,6 @@ def _run_detection(
 
                 elapsed = time.time() - t0
                 frame_ts.append(elapsed)
-                if len(frame_ts) > 30:
-                    frame_ts.pop(0)
                 with _det_lock:
                     _det_state['fps'] = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
 
@@ -583,7 +643,8 @@ def _run_detection(
         else:
             import mss as _mss_mod
             with _mss_mod.MSS() as sct:
-                mon  = sct.monitors[1]
+                _mons = sct.monitors
+                mon   = _mons[min(monitor_index + 1, len(_mons) - 1)]
                 mw, mh = mon['width'], mon['height']
                 cap  = {
                     'left':   mon['left'] + mw // 2 - crop // 2,
@@ -601,8 +662,6 @@ def _run_detection(
 
                     elapsed = time.time() - t0
                     frame_ts.append(elapsed)
-                    if len(frame_ts) > 30:
-                        frame_ts.pop(0)
                     with _det_lock:
                         _det_state['fps'] = round(1.0 / (sum(frame_ts) / len(frame_ts)), 1) if frame_ts else 0.0
 
@@ -610,8 +669,19 @@ def _run_detection(
         msg = f"Detection loop crashed: {exc}"
         logger.error(msg, exc_info=True)
         with _det_lock:
-            _det_state['running']    = False
             _det_state['last_error'] = msg
+
+    # Release VRAM immediately so the GPU is available for other work
+    try:
+        import torch as _torch
+        try:
+            del model
+        except NameError:
+            pass
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+    except Exception:
+        pass
 
     with _det_lock:
         _det_state['running'] = False
@@ -622,6 +692,29 @@ def _run_detection(
 @app.route('/api/detection/modes')
 def detection_modes_route():
     return jsonify(AIM_MODES)
+
+
+@app.route('/api/detection/monitors')
+def detection_monitors_route():
+    """Enumerate available displays for screen capture selection."""
+    try:
+        import mss
+        with mss.MSS() as sct:
+            monitors = []
+            for i, m in enumerate(sct.monitors[1:], start=0):
+                monitors.append({
+                    'index':   i,
+                    'left':    m['left'],  'top':    m['top'],
+                    'width':   m['width'], 'height': m['height'],
+                    'label':   f'Monitor {i + 1}  ({m["width"]}×{m["height"]})',
+                    'primary': i == 0,
+                })
+        return jsonify({'monitors': monitors})
+    except Exception as exc:
+        logger.warning("Monitor enumeration failed: %s", exc)
+        return jsonify({'monitors': [
+            {'index': 0, 'label': 'Primary (default)', 'primary': True, 'width': 0, 'height': 0}
+        ]})
 
 
 @app.route('/api/detection/last-error')
@@ -639,17 +732,25 @@ def detection_start():
     mode   = d.get('mode', 'track')
     preset = AIM_MODES.get(mode, AIM_MODES['track']).copy()
 
-    classes         = d.get('classes',         ['person', 'head'])
-    confidence      = float(d.get('confidence',      0.25))
-    cooldown_ms     = float(d.get('cooldown_ms',     preset['cooldown_ms']))
-    fov_config      = d.get('fov_config')
-    max_mvmt_ms     = float(d.get('max_movement_ms', preset['max_movement_ms']))
-    interval_ms     = float(d.get('interval_ms',     preset['interval_ms']))
-    aim_height      = float(d.get('aim_height',      preset['aim_height']))
-    lead_ms         = float(d.get('lead_ms',         0.0))
-    rcs_strength    = float(d.get('rcs_strength',    0.0))
-    target_radius   = float(d.get('target_radius',   preset['target_radius']))
-    progress_center = float(d.get('progress_center', preset['progress_center']))
+    classes              = d.get('classes',               ['person', 'head'])
+    confidence           = max(0.01, min(1.0, float(d.get('confidence',           0.25))))
+    cooldown_ms          = max(0.0,             float(d.get('cooldown_ms',          preset['cooldown_ms'])))
+    fov_config           = d.get('fov_config')
+    max_mvmt_ms          = max(1.0,  min(2000.0, float(d.get('max_movement_ms',    preset['max_movement_ms']))))
+    interval_ms          = max(1.0,             float(d.get('interval_ms',          preset['interval_ms'])))
+    aim_height           = max(0.0,  min(1.0,   float(d.get('aim_height',          preset['aim_height']))))
+    lead_ms              = max(0.0,  min(500.0, float(d.get('lead_ms',             0.0))))
+    rcs_strength         = max(0.0,  min(1.0,   float(d.get('rcs_strength',        0.0))))
+    target_radius        = max(1.0,             float(d.get('target_radius',        preset['target_radius'])))
+    progress_center      = max(0.01, min(0.99,  float(d.get('progress_center',     preset['progress_center']))))
+    fov_distance         = max(0.0,  min(640.0, float(d.get('fov_distance',        0.0))))
+    next_target_delay_ms = max(0.0,  min(2000.0, float(d.get('next_target_delay_ms', 0.0))))
+    jitter_ms            = max(0.0,  min(500.0, float(d.get('jitter_ms',           0.0))))
+    target_priority      = d.get('target_priority', 'nearest')
+    if target_priority not in ('nearest', 'largest', 'confidence'):
+        target_priority = 'nearest'
+    auto_click    = bool(d.get('auto_click', False))
+    monitor_index = max(0, min(8, int(d.get('monitor_index', 0))))
 
     with _det_lock:
         _det_state.update({
@@ -662,6 +763,9 @@ def detection_start():
                 'aim_height': aim_height, 'lead_ms': lead_ms,
                 'rcs_strength': rcs_strength, 'target_radius': target_radius,
                 'progress_center': progress_center,
+                'fov_distance': fov_distance, 'next_target_delay_ms': next_target_delay_ms,
+                'jitter_ms': jitter_ms, 'target_priority': target_priority,
+                'auto_click': auto_click, 'monitor_index': monitor_index,
             },
             'last_error': None,
         })
@@ -669,7 +773,9 @@ def detection_start():
         target=_run_detection,
         args=(classes, confidence, cooldown_ms, fov_config,
               max_mvmt_ms, interval_ms, aim_height, mode,
-              lead_ms, rcs_strength, target_radius, progress_center),
+              lead_ms, rcs_strength, target_radius, progress_center,
+              fov_distance, next_target_delay_ms, jitter_ms, target_priority,
+              auto_click, monitor_index),
         daemon=True,
     )
     with _det_lock:
@@ -778,6 +884,11 @@ def serial_send_reports():
 
     if not reports:
         return jsonify({'ok': False, 'error': 'No reports provided'}), 400
+
+    # Cap at 2000 reports (2 seconds at 1 kHz) to prevent multi-second blocking sends
+    MAX_REPORTS = 2000
+    if len(reports) > MAX_REPORTS:
+        return jsonify({'ok': False, 'error': f'Too many reports ({len(reports)}); max {MAX_REPORTS}'}), 400
 
     # Run transmission in a background thread so we can stream progress.
     def do_send():

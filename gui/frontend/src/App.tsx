@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom'
 import Sidebar from './components/Sidebar'
 import Dashboard from './pages/Dashboard'
 import Inference from './pages/Inference'
@@ -8,7 +8,32 @@ import Metrics from './pages/Metrics'
 import About from './pages/About'
 import Device from './pages/Device'
 import Settings from './pages/Settings'
+import Overlay from './pages/Overlay'
 import { api } from './services/api'
+
+function AppLayout() {
+  const location = useLocation()
+  if (location.pathname === '/overlay') {
+    return <Overlay />
+  }
+  return (
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+      <Sidebar />
+      <main style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-primary)' }}>
+        <Routes>
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/inference" element={<Inference />} />
+          <Route path="/device" element={<Device />} />
+          <Route path="/training" element={<Training />} />
+          <Route path="/metrics" element={<Metrics />} />
+          <Route path="/about" element={<About />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="/overlay" element={<Overlay />} />
+        </Routes>
+      </main>
+    </div>
+  )
+}
 
 export default function App() {
   useEffect(() => {
@@ -18,20 +43,7 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
-        <Sidebar />
-        <main style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-primary)' }}>
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/inference" element={<Inference />} />
-            <Route path="/device" element={<Device />} />
-            <Route path="/training" element={<Training />} />
-            <Route path="/metrics" element={<Metrics />} />
-            <Route path="/about" element={<About />} />
-            <Route path="/settings" element={<Settings />} />
-          </Routes>
-        </main>
-      </div>
+      <AppLayout />
     </BrowserRouter>
   )
 }

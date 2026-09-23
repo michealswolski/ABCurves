@@ -11,12 +11,33 @@ ch9329    : 8-byte binary CH9329 packet
 raw_binary: 4-byte little-endian int16 pairs [dx, dy] per report
 """
 
+import ctypes
 import struct
+import sys
 import threading
 import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+
+# On Windows, raise the multimedia timer resolution to 1ms so time.sleep(0.001)
+# actually fires at ~1ms instead of the default 15ms system tick.
+_winmm = None
+if sys.platform == 'win32':
+    try:
+        _winmm = ctypes.WinDLL('winmm')
+    except OSError:
+        pass
+
+
+def _set_timer_res(period_ms: int):
+    if _winmm:
+        _winmm.timeBeginPeriod(period_ms)
+
+
+def _restore_timer_res(period_ms: int):
+    if _winmm:
+        _winmm.timeEndPeriod(period_ms)
 
 import serial
 import serial.tools.list_ports
@@ -218,6 +239,12 @@ class SerialManager:
 
     # ── transmission ─────────────────────────────────────────────────────────
 
+    # Minimum spacing between reports — enforced to keep output at or below 1 kHz.
+    # The MAKCU firmware and most HID bridges operate on 1 ms USB frames; sending
+    # faster than this causes reports to stack inside the same frame, which
+    # anti-cheat systems flag as a super-human poll rate.
+    MIN_INTERVAL_MS = 1.0
+
     def send_reports(self, reports: list[list[int]],
                      report_interval_ms: float = 1.0,
                      on_progress=None) -> dict:
@@ -226,32 +253,38 @@ class SerialManager:
         Args:
             reports:             List of [dx, dy] int16 pairs.
             report_interval_ms:  Spacing between reports (default 1 ms = 1 kHz).
+                                 Values below MIN_INTERVAL_MS are clamped up to
+                                 prevent the output rate from exceeding 1 kHz.
             on_progress:         Optional callback(sent, total) per report.
         """
-        if not self.is_connected:
-            return {"ok": False, "error": "Not connected"}
-
         encoder = PROTOCOLS.get(self._protocol, _text_packet)
-        sleep_s  = report_interval_ms / 1000.0
+        interval_ms = max(float(report_interval_ms), self.MIN_INTERVAL_MS)
+        sleep_s  = interval_ms / 1000.0
         errors   = 0
 
         with self._lock:
-            for i, (dx, dy) in enumerate(reports):
-                try:
-                    pkt = encoder(int(dx), int(dy))
-                    self._port.write(pkt)
-                    self._stats.bytes_sent   += len(pkt)
-                    self._stats.reports_sent += 1
-                except serial.SerialException as exc:
-                    logger.warning("TX error at report %d: %s", i, exc)
-                    self._stats.errors += 1
-                    errors += 1
+            if self._port is None or not self._port.is_open:
+                return {"ok": False, "error": "Not connected"}
+            _set_timer_res(1)
+            try:
+                for i, (dx, dy) in enumerate(reports):
+                    try:
+                        pkt = encoder(int(dx), int(dy))
+                        self._port.write(pkt)
+                        self._stats.bytes_sent   += len(pkt)
+                        self._stats.reports_sent += 1
+                    except serial.SerialException as exc:
+                        logger.warning("TX error at report %d: %s", i, exc)
+                        self._stats.errors += 1
+                        errors += 1
 
-                if on_progress:
-                    on_progress(i + 1, len(reports))
+                    if on_progress:
+                        on_progress(i + 1, len(reports))
 
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                    if sleep_s > 0 and i < len(reports) - 1:
+                        time.sleep(sleep_s)
+            finally:
+                _restore_timer_res(1)
 
         sent_ok = len(reports) - errors
         return {
@@ -263,11 +296,11 @@ class SerialManager:
 
     def send_single(self, dx: int, dy: int) -> dict:
         """Send a single mouse-move report (for manual control / testing)."""
-        if not self.is_connected:
-            return {"ok": False, "error": "Not connected"}
         encoder = PROTOCOLS.get(self._protocol, _text_packet)
         try:
             with self._lock:
+                if self._port is None or not self._port.is_open:
+                    return {"ok": False, "error": "Not connected"}
                 pkt = encoder(int(dx), int(dy))
                 self._port.write(pkt)
                 self._stats.bytes_sent   += len(pkt)
@@ -279,10 +312,10 @@ class SerialManager:
 
     def click(self, button: str = "left") -> dict:
         """Send a mouse click (press + release)."""
-        if not self.is_connected:
-            return {"ok": False, "error": "Not connected"}
         try:
             with self._lock:
+                if self._port is None or not self._port.is_open:
+                    return {"ok": False, "error": "Not connected"}
                 if self._protocol == "makcu":
                     # Official MAKCU Native API: km.left(1)\r\n then km.left(0)\r\n
                     btn = {"left": "left", "right": "right", "middle": "middle"}.get(button, "left")
@@ -317,8 +350,6 @@ class SerialManager:
           {"type": "click", "button": "left"|"right"|"middle"}
           {"type": "pause", "ms": float}
         """
-        if not self.is_connected:
-            return {"ok": False, "error": "Not connected"}
         encoder = PROTOCOLS.get(self._protocol, _text_packet)
         errors = 0
         total = len(events)
@@ -328,20 +359,15 @@ class SerialManager:
                 if etype == "move":
                     pkt = encoder(int(ev.get("dx", 0)), int(ev.get("dy", 0)))
                     with self._lock:
+                        if self._port is None or not self._port.is_open:
+                            return {"ok": False, "error": "Not connected"}
                         self._port.write(pkt)
                         self._stats.bytes_sent += len(pkt)
                         self._stats.reports_sent += 1
                 elif etype == "click":
-                    btn = ev.get("button", "left")
-                    with self._lock:
-                        if self._protocol == "makcu":
-                            b = {"left": "left", "right": "right", "middle": "middle"}.get(btn, "left")
-                            self._port.write(f"km.{b}(1)\r\n".encode())
-                            time.sleep(0.01)
-                            self._port.write(f"km.{b}(0)\r\n".encode())
-                        else:
-                            cmd_map = {"left": "CL\n", "right": "CR\n", "middle": "CM\n"}
-                            self._port.write(cmd_map.get(btn, "CL\n").encode())
+                    res = self.click(ev.get("button", "left"))
+                    if not res.get("ok"):
+                        raise serial.SerialException(res.get("error", "click failed"))
                 elif etype == "pause":
                     time.sleep(float(ev.get("ms", 50)) / 1000.0)
             except serial.SerialException as exc:
