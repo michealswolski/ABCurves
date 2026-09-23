@@ -21,3 +21,6 @@ data/private/
 Thumbs.db
 .idea/
 .vscode/
+.claude/
+gui/frontend/node_modules/
+gui/frontend/dist/
