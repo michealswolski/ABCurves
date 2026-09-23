@@ -217,6 +217,9 @@ export default function Inference() {
     return () => sock?.close()
   }, [])
 
+  // Auto-load example data on mount so the renderer profile is always ready
+  useEffect(() => { loadExample() }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
   const parsePrefixText = useCallback((text: string) => {
     try {
       const parsed = JSON.parse(text)
