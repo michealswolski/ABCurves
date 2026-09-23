@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import MovementCanvas from '../components/MovementCanvas'
 import { api, InferenceResult, SerialStatus } from '../services/api'
@@ -67,6 +67,44 @@ export default function Inference() {
   const [batchResults, setBatchResults] = useState<Array<{index: number; seed: number; latency_ms: number; continuation: [number,number][]; length: number}>>([])
   const [selectedBatch, setSelectedBatch] = useState(0)
 
+  // Tracking / prediction
+  const [trackingMode, setTrackingMode] = useState(false)
+  const [velocityX, setVelocityX] = useState(0)
+  const [velocityY, setVelocityY] = useState(0)
+
+  const [fovConfig] = useState<{ dpi: number; sensitivity: number; fovH: number; screenW: number } | null>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('fov_config') || 'null')
+      if (saved) return saved
+    } catch {}
+    // Write and return defaults so the FOV circle shows even before Settings is visited
+    const defaults = { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 1920 }
+    try { localStorage.setItem('fov_config', JSON.stringify(defaults)) } catch {}
+    return defaults
+  })
+
+  const countsPerPixel = useMemo(() => {
+    if (!fovConfig) return null
+    const cpd = (fovConfig.dpi / 400) / (fovConfig.sensitivity * 0.022)
+    return cpd * (fovConfig.fovH / fovConfig.screenW)
+  }, [fovConfig])
+
+  const predictedTarget = useMemo((): [number, number] | null => {
+    if (!trackingMode) return null
+    const travelSec = 256 / 1000
+    if (countsPerPixel) {
+      return [
+        target[0] + velocityX * countsPerPixel * travelSec,
+        target[1] + velocityY * countsPerPixel * travelSec,
+      ]
+    }
+    // Fallback: treat velocity as counts/sec directly
+    return [
+      target[0] + velocityX * travelSec,
+      target[1] + velocityY * travelSec,
+    ]
+  }, [trackingMode, target, velocityX, velocityY, countsPerPixel])
+
   // MAKCU state
   const [serialStatus, setSerialStatus] = useState<SerialStatus | null>(null)
   const [sending, setSending] = useState(false)
@@ -130,11 +168,12 @@ export default function Inference() {
 
     const actualSeed = seedLocked ? seed : Math.floor(Math.random() * 100000)
     if (!seedLocked) setSeed(actualSeed)
+    const effectiveTarget = predictedTarget ?? target
 
     try {
       if (batchMode) {
         const res = await api.batchInference({
-          prefix, target, target_radius: radius, progress_center: progressCenter,
+          prefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter,
           seed: actualSeed, n: batchN,
         })
         setBatchResults(res.results)
@@ -153,7 +192,7 @@ export default function Inference() {
         }
       } else {
         const res = await api.runInference({
-          prefix, target, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
+          prefix, target: effectiveTarget, target_radius: radius, progress_center: progressCenter, seed: actualSeed,
         })
         setResult(res)
         setBatchResults([])
@@ -166,7 +205,7 @@ export default function Inference() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Inference failed')
     } finally { setLoading(false) }
-  }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN])
+  }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN, predictedTarget])
 
   // Space = run inference keyboard shortcut
   useEffect(() => {
@@ -375,6 +414,66 @@ export default function Inference() {
             )}
           </div>
 
+          {/* Tracking / prediction mode */}
+          <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: '12px 16px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 13 }}>🎯</span>
+                <div>
+                  <div style={{ fontSize: 12, color: 'rgba(180,74,255,0.9)', fontWeight: 600 }}>Tracking Mode</div>
+                  <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.3)' }}>Predict moving target</div>
+                </div>
+              </div>
+              <button
+                onClick={() => setTrackingMode(v => !v)}
+                style={{
+                  width: 44, height: 24, borderRadius: 12,
+                  background: trackingMode ? 'rgba(180,74,255,0.25)' : 'rgba(0,212,255,0.08)',
+                  border: `1px solid ${trackingMode ? 'rgba(180,74,255,0.4)' : 'rgba(0,212,255,0.15)'}`,
+                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s',
+                }}>
+                <div style={{
+                  width: 16, height: 16, borderRadius: '50%',
+                  background: trackingMode ? '#b44aff' : 'rgba(126,200,227,0.3)',
+                  position: 'absolute', top: 3, left: trackingMode ? 24 : 4,
+                  transition: 'all 0.2s', boxShadow: trackingMode ? '0 0 6px #b44aff' : 'none',
+                }} />
+              </button>
+            </div>
+            {trackingMode && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.45)', marginBottom: 8 }}>
+                  Velocity ({countsPerPixel ? 'px/sec' : 'counts/sec'})
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {(['X', 'Y'] as const).map((axis, i) => (
+                    <div key={axis} style={{ flex: 1 }}>
+                      <div style={{ fontSize: 10, color: 'rgba(180,74,255,0.5)', marginBottom: 3 }}>{axis}</div>
+                      <input type="number" className="form-input"
+                        style={{ width: '100%', borderColor: 'rgba(180,74,255,0.3)' }}
+                        value={i === 0 ? velocityX : velocityY}
+                        onChange={e => i === 0 ? setVelocityX(Number(e.target.value)) : setVelocityY(Number(e.target.value))} />
+                    </div>
+                  ))}
+                </div>
+                {predictedTarget && (
+                  <div style={{
+                    marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                    background: 'rgba(180,74,255,0.06)', border: '1px solid rgba(180,74,255,0.18)',
+                    fontFamily: 'JetBrains Mono', fontSize: 10, color: 'rgba(180,74,255,0.8)',
+                  }}>
+                    C′ = ({predictedTarget[0].toFixed(1)}, {predictedTarget[1].toFixed(1)}) in 256ms
+                  </div>
+                )}
+                {!fovConfig && (
+                  <div style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)', marginTop: 6 }}>
+                    ⚠ Set FOV Scale in Settings for px/sec conversion
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Run inference */}
           <button className="btn btn-primary"
             style={{ justifyContent: 'center', padding: '13px', fontSize: 13 }}
@@ -480,6 +579,9 @@ export default function Inference() {
               width={620}
               height={380}
               onTargetClick={(x, y) => setTarget([x, y])}
+              fovOverlay={fovConfig}
+              predictedTarget={predictedTarget}
+              trackingVelocityCps={trackingMode ? [velocityX, velocityY] : null}
             />
           </div>
 

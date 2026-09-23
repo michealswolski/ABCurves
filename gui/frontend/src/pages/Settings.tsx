@@ -1,7 +1,25 @@
-import React, { useEffect, useState } from 'react'
-import { Settings as SettingsIcon, Sun, Moon, Sliders, Terminal, CheckCircle2 } from 'lucide-react'
+import React, { useEffect, useState, useMemo } from 'react'
+import { Settings as SettingsIcon, Sun, Moon, Sliders, Terminal, CheckCircle2, Crosshair } from 'lucide-react'
 
 const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+
+const FOV_PRESETS = [
+  { id: 'cs2',       label: 'CS2',      sensitivity: 3.2554, fovH: 106.26 },
+  { id: 'valorant',  label: 'Valorant', sensitivity: 0.5,    fovH: 103.0  },
+  { id: 'apex',      label: 'Apex',     sensitivity: 3.2554, fovH: 110.0  },
+  { id: 'custom',    label: 'Custom',   sensitivity: 1.0,    fovH: 106.26 },
+]
+
+const RESOLUTIONS = [
+  { label: '1920×1080', w: 1920 },
+  { label: '2560×1440', w: 2560 },
+  { label: '1280×720',  w: 1280 },
+  { label: '2560×1080', w: 2560 },
+]
+
+function defaultFovConfig() {
+  return { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 1920 }
+}
 
 export default function Settings() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() =>
@@ -14,6 +32,33 @@ export default function Settings() {
     localStorage.getItem('pythonPath') || ''
   )
   const [savedFeedback, setSavedFeedback] = useState('')
+
+  const [fovConfig, setFovConfig] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('fov_config') || 'null')
+      if (saved) return saved
+    } catch {}
+    const defaults = defaultFovConfig()
+    try { localStorage.setItem('fov_config', JSON.stringify(defaults)) } catch {}
+    return defaults
+  })
+
+  const updateFov = (patch: Partial<typeof fovConfig>) => {
+    setFovConfig((prev: typeof fovConfig) => {
+      const next = { ...prev, ...patch }
+      try { localStorage.setItem('fov_config', JSON.stringify(next)) } catch {}
+      flashSaved('FOV settings saved')
+      return next
+    })
+  }
+
+  const countsPerDegree = useMemo(() =>
+    (fovConfig.dpi / 400) / (fovConfig.sensitivity * 0.022)
+  , [fovConfig.dpi, fovConfig.sensitivity])
+
+  const countsPerPixel = useMemo(() =>
+    countsPerDegree * (fovConfig.fovH / fovConfig.screenW)
+  , [countsPerDegree, fovConfig.fovH, fovConfig.screenW])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -97,6 +142,72 @@ export default function Settings() {
             <span style={{ fontSize: 11, color: 'rgba(126,200,227,0.35)' }}>
               Used as the pre-selected baud rate when opening the Device page
             </span>
+          </div>
+        </div>
+
+        {/* FOV Scale */}
+        <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
+          <div className="section-header"><Crosshair size={13} /> FOV Scale &amp; Sensitivity</div>
+          <p style={{ fontSize: 11, color: 'rgba(126,200,227,0.4)', marginBottom: 14, lineHeight: 1.6 }}>
+            Converts screen pixels ↔ mouse counts for tracking prediction. Trained model baseline: CS2 sens 3.2554 @ 400 DPI.
+          </p>
+
+          {/* Game presets */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+            {FOV_PRESETS.map(p => (
+              <button key={p.id}
+                className={`btn ${fovConfig.game === p.id ? 'btn-primary' : 'btn-secondary'}`}
+                style={{ fontSize: 11, padding: '4px 8px', flex: 1, justifyContent: 'center' }}
+                onClick={() => updateFov({ game: p.id, sensitivity: p.sensitivity, fovH: p.fovH })}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">DPI</label>
+              <input className="form-input" type="number" value={fovConfig.dpi} min={100} max={25600} step={100}
+                onChange={e => updateFov({ dpi: Number(e.target.value) })} />
+            </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">In-game Sensitivity</label>
+              <input className="form-input" type="number" value={fovConfig.sensitivity} step={0.01}
+                onChange={e => updateFov({ sensitivity: Number(e.target.value) })} />
+            </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">FOV Horizontal (°)</label>
+              <input className="form-input" type="number" value={fovConfig.fovH} step={0.1} min={60} max={180}
+                onChange={e => updateFov({ fovH: Number(e.target.value), game: 'custom' })} />
+            </div>
+            <div className="form-group" style={{ marginBottom: 0 }}>
+              <label className="form-label">Screen Width (px)</label>
+              <select className="form-input" value={fovConfig.screenW}
+                onChange={e => updateFov({ screenW: Number(e.target.value) })}>
+                {RESOLUTIONS.map(r => (
+                  <option key={r.label} value={r.w}>{r.label}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div style={{
+            display: 'flex', gap: 20, padding: '10px 14px', borderRadius: 8,
+            background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
+            fontSize: 11, fontFamily: 'JetBrains Mono',
+          }}>
+            <div>
+              <span style={{ color: 'rgba(126,200,227,0.4)' }}>counts/degree</span>
+              <div style={{ color: '#00d4ff', fontWeight: 700 }}>{countsPerDegree.toFixed(2)}</div>
+            </div>
+            <div>
+              <span style={{ color: 'rgba(126,200,227,0.4)' }}>counts/pixel</span>
+              <div style={{ color: '#00d4ff', fontWeight: 700 }}>{countsPerPixel.toFixed(4)}</div>
+            </div>
+            <div>
+              <span style={{ color: 'rgba(126,200,227,0.4)' }}>pixels/count</span>
+              <div style={{ color: '#00d4ff', fontWeight: 700 }}>{(1 / countsPerPixel).toFixed(2)}</div>
+            </div>
           </div>
         </div>
 

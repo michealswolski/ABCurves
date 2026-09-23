@@ -1,5 +1,12 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react'
 
+interface FovOverlay {
+  dpi: number
+  sensitivity: number
+  fovH: number
+  screenW: number
+}
+
 interface MovementCanvasProps {
   prefix: [number, number][]
   continuation: [number, number][]
@@ -8,6 +15,9 @@ interface MovementCanvasProps {
   width?: number
   height?: number
   onTargetClick?: (x: number, y: number) => void
+  fovOverlay?: FovOverlay | null
+  predictedTarget?: [number, number] | null
+  trackingVelocityCps?: [number, number] | null
 }
 
 function integrateDeltas(deltas: [number, number][], sx = 0, sy = 0): [number, number][] {
@@ -175,7 +185,7 @@ function drawTarget(
 export default function MovementCanvas({
   prefix, continuation, target,
   targetRadius = 20, width = 620, height = 400,
-  onTargetClick,
+  onTargetClick, fovOverlay, predictedTarget, trackingVelocityCps,
 }: MovementCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const animRef = useRef<number>(0)
@@ -194,10 +204,88 @@ export default function MovementCanvas({
     const contPts = continuation.length > 0 ? integrateDeltas(continuation, last[0], last[1]) : []
 
     const all: [number, number][] = [...prefixPts, ...contPts]
-    const { scale: s, offsetX: ox, offsetY: oy } = fitToCanvas(all, target, width, height)
+    const extraTarget = predictedTarget ?? null
+    const { scale: s, offsetX: ox, offsetY: oy } = fitToCanvas(
+      extraTarget ? [...all, extraTarget] : all, target, width, height
+    )
     transformRef.current = { scale: s, offsetX: ox, offsetY: oy }
 
     if (target) drawTarget(ctx, target, s, ox, oy, targetRadius)
+
+    // FOV circle centered on B (end of prefix = takeover point)
+    if (fovOverlay && prefixPts.length > 0) {
+      const bPt = prefixPts[prefixPts.length - 1]
+      const [bx, by] = tc(bPt, s, ox, oy)
+      const countsPerDeg = (fovOverlay.dpi / 400) / (fovOverlay.sensitivity * 0.022)
+      const fovRadCounts = (fovOverlay.fovH / 2) * countsPerDeg
+      const fovRadPx = fovRadCounts * s
+      const maxR = Math.min(width, height) * 0.9
+      // Only draw if circle fits meaningfully; if huge, draw capped to show context
+      const drawR = Math.min(fovRadPx, maxR)
+      ctx.beginPath()
+      ctx.arc(bx, by, drawR, 0, Math.PI * 2)
+      ctx.strokeStyle = 'rgba(0,212,255,0.25)'
+      ctx.lineWidth = 1
+      ctx.setLineDash([5, 5])
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.font = '9px "JetBrains Mono", monospace'
+      ctx.fillStyle = 'rgba(0,212,255,0.45)'
+      const fovLabel = fovRadPx > maxR
+        ? `FOV ${fovOverlay.fovH}° (${Math.round(fovRadCounts)} ct)`
+        : `FOV ${fovOverlay.fovH}°`
+      // Place label near the top of the visible arc or top-left of canvas
+      const labelX = Math.max(4, bx - drawR + 4)
+      const labelY = Math.max(12, by - drawR + 12)
+      ctx.fillText(fovLabel, labelX, labelY)
+    }
+
+    // Predicted target (tracking mode)
+    if (predictedTarget && target) {
+      const [ptx, pty] = tc(predictedTarget, s, ox, oy)
+      const [tx, ty] = tc(target, s, ox, oy)
+      const rPx = Math.max((targetRadius || 20) * s, 12)
+
+      // Velocity arrow from target → predicted
+      ctx.beginPath()
+      ctx.moveTo(tx, ty)
+      ctx.lineTo(ptx, pty)
+      ctx.strokeStyle = 'rgba(180,74,255,0.6)'
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 3])
+      ctx.stroke()
+      ctx.setLineDash([])
+
+      // Predicted C circle
+      ctx.beginPath()
+      ctx.arc(ptx, pty, rPx, 0, Math.PI * 2)
+      ctx.strokeStyle = 'rgba(180,74,255,0.8)'
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 3])
+      ctx.stroke()
+      ctx.setLineDash([])
+      ctx.fillStyle = 'rgba(180,74,255,0.08)'
+      ctx.fill()
+
+      // Center dot
+      ctx.beginPath()
+      ctx.arc(ptx, pty, 4, 0, Math.PI * 2)
+      ctx.fillStyle = '#b44aff'
+      ctx.shadowColor = '#b44aff'
+      ctx.shadowBlur = 10
+      ctx.fill()
+      ctx.shadowBlur = 0
+
+      // Label
+      ctx.font = '10px "JetBrains Mono", monospace'
+      ctx.fillStyle = 'rgba(180,74,255,0.7)'
+      ctx.fillText('C’ pred', ptx + rPx + 6, pty - 2)
+      if (trackingVelocityCps) {
+        ctx.fillStyle = 'rgba(180,74,255,0.45)'
+        ctx.font = '9px "JetBrains Mono", monospace'
+        ctx.fillText(`v=(${trackingVelocityCps[0]},${trackingVelocityCps[1]})`, ptx + rPx + 6, pty + 11)
+      }
+    }
 
     if (prefixPts.length > 1)
       drawGlowLine(ctx, prefixPts, s, ox, oy, '#00d4ff', 'rgba(0,212,255,0.12)')
@@ -230,7 +318,7 @@ export default function MovementCanvas({
       ctx.fillStyle = 'rgba(200,230,240,0.55)'
       ctx.fillText(label as string, (lx as number) + 28, ly)
     })
-  }, [prefix, continuation, target, targetRadius, width, height])
+  }, [prefix, continuation, target, targetRadius, width, height, fovOverlay, predictedTarget, trackingVelocityCps])
 
   const playAnimation = useCallback(() => {
     if (animating) return
