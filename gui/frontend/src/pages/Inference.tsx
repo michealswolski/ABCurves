@@ -292,23 +292,18 @@ export default function Inference() {
     } finally { setLoading(false) }
   }, [prefix, target, radius, progressCenter, seed, seedLocked, batchMode, batchN, predictedTarget, rendererProfile])
 
-  // Space = run inference keyboard shortcut
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName.toLowerCase()
-      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
-      if (e.code === 'Space' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        e.preventDefault()
-        if (!loading && !prefixError) runInference()
-      }
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [loading, prefixError, runInference])
+  // Max movement duration (ms) — mirrored from/to localStorage
+  const [maxMovementMs, setMaxMovementMs] = useState(() =>
+    Number(localStorage.getItem('max_movement_ms') || 120))
+  const saveMaxMs = (v: number) => {
+    setMaxMovementMs(v)
+    try { localStorage.setItem('max_movement_ms', String(v)) } catch {}
+  }
 
-  // Cap continuation to a max movement duration so a 370-report output
-  // doesn't take 370ms — competitive flicks should land in 80–150ms.
-  const maxReports = Math.ceil(Number(localStorage.getItem('max_movement_ms') || 120) / Math.max(intervalMs, 0.5))
+  // Advanced panel collapsed by default
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
+  const maxReports = Math.ceil(maxMovementMs / Math.max(intervalMs, 0.5))
   const trimmedContinuation = useMemo((): [number, number][] => {
     if (!result?.continuation) return []
     return (result.continuation as [number, number][]).slice(0, maxReports)
@@ -378,27 +373,25 @@ export default function Inference() {
 
   return (
     <div className="page animate-in">
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+      <div style={{ marginBottom: 4 }}>
         <h1 className="page-title">Inference</h1>
-        <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.3)', fontFamily: 'JetBrains Mono' }}>
-          Space = Run · R = Replay
-        </div>
+        <p className="page-subtitle">Set a target → generate movement → send to MAKCU</p>
       </div>
-      <p className="page-subtitle">Generate realistic mouse movement continuations from a recorded prefix</p>
 
       <div style={{ display: 'grid', gridTemplateColumns: '290px 1fr', gap: 20 }}>
 
         {/* ── Controls ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
-            <div className="section-header">Parameters</div>
+
+            {/* ── Target ── */}
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
               <div style={{ flex: 1 }}>
-                <XYInput label="Target Offset B→C (mouse counts)" value={target} onChange={setTarget} />
+                <XYInput label="Target (mouse counts)" value={target} onChange={setTarget} />
               </div>
               <button
                 onClick={() => setAutoTarget(v => !v)}
-                title={autoTarget ? 'Disable auto-target feed' : 'Enable auto-target via WebSocket push'}
+                title={autoTarget ? 'Disable live target feed' : 'Enable live target via WebSocket push'}
                 style={{
                   marginTop: 22, padding: '5px 9px', fontSize: 10, borderRadius: 6,
                   background: autoTarget ? 'rgba(57,255,20,0.12)' : 'rgba(0,212,255,0.06)',
@@ -412,225 +405,100 @@ export default function Inference() {
               </button>
             </div>
             <PixelConverter countsPerPixel={countsPerPixel} onConvert={setTarget} />
-            <InputRow label="Target Radius" hint="Acceptance radius in counts">
-              <input type="number" className="form-input" style={{ width: '100%' }} value={radius}
-                onChange={e => setRadius(Number(e.target.value))} min={5} max={200} />
-            </InputRow>
-            <InputRow label="Progress Center" hint="Cut point B — 0.6–0.8 recommended (player covers that naturally)">
-              <input type="range" style={{ width: '100%', accentColor: '#00d4ff' }}
-                value={progressCenter} min={0} max={1} step={0.05}
-                onChange={e => setProgressCenter(Number(e.target.value))} />
-              <span style={{ fontSize: 12, color: '#00d4ff', fontFamily: 'JetBrains Mono' }}>
-                {progressCenter.toFixed(2)}
-              </span>
-            </InputRow>
 
-            {/* Seed with lock toggle */}
-            <div className="form-group">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                <label className="form-label" style={{ marginBottom: 0 }}>Random Seed</label>
-                <button
-                  onClick={() => setSeedLocked(v => !v)}
-                  title={seedLocked ? 'Seed is locked — click to randomize each run' : 'Seed is random — click to lock'}
-                  style={{
-                    cursor: 'pointer', padding: '2px 6px',
-                    borderRadius: 4, display: 'flex', alignItems: 'center', gap: 4,
-                    fontSize: 10, color: seedLocked ? '#00d4ff' : 'rgba(126,200,227,0.4)',
-                    background: seedLocked ? 'rgba(0,212,255,0.08)' : 'rgba(0,212,255,0.03)',
-                    border: `1px solid ${seedLocked ? 'rgba(0,212,255,0.2)' : 'rgba(0,212,255,0.07)'}`,
-                  } as React.CSSProperties}
-                >
-                  {seedLocked ? <Lock size={11} /> : <Unlock size={11} />}
-                  {seedLocked ? 'locked' : 'random'}
-                </button>
-              </div>
-              <input type="number" className="form-input" style={{ width: '100%', opacity: seedLocked ? 1 : 0.5 }}
-                value={seed} onChange={e => setSeed(Number(e.target.value))}
-                disabled={!seedLocked} />
-              {!seedLocked && (
-                <span style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)' }}>
-                  Seed will be randomized each run
+            {/* ── Movement Speed ── */}
+            <div className="form-group" style={{ marginTop: 6 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                <label className="form-label" style={{ marginBottom: 0 }}>Movement Speed</label>
+                <span style={{ fontFamily: 'JetBrains Mono', fontSize: 13, color: '#00d4ff', fontWeight: 700 }}>
+                  {maxMovementMs} ms
                 </span>
-              )}
+              </div>
+              <input type="range" min={40} max={400} step={10} value={maxMovementMs}
+                style={{ width: '100%', accentColor: '#00d4ff' }}
+                onChange={e => saveMaxMs(Number(e.target.value))} />
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'rgba(126,200,227,0.35)', marginTop: 2 }}>
+                <span>Fast (40ms)</span>
+                <span>Slow (400ms)</span>
+              </div>
             </div>
-          </div>
 
-          <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
-            <div className="section-header">Prefix Data</div>
-            <div className="form-group">
-              <label className="form-label">dx/dy pairs (JSON)</label>
-              <textarea
-                style={{
-                  background: 'rgba(0,4,14,0.9)',
-                  border: '1px solid rgba(0,212,255,0.12)',
-                  borderRadius: 6, color: '#00ffcc',
-                  padding: '8px 12px', width: '100%',
-                  minHeight: 90, resize: 'vertical',
-                  fontFamily: 'JetBrains Mono, monospace', fontSize: 11,
-                  outline: 'none',
-                }}
-                value={prefixText}
-                onChange={e => { setPrefixText(e.target.value); parsePrefixText(e.target.value) }}
-                spellCheck={false}
-              />
-              {prefixError && <span style={{ color: '#ff2d78', fontSize: 11 }}>{prefixError}</span>}
-              <span style={{ fontSize: 11, color: 'rgba(0,212,255,0.4)', fontFamily: 'JetBrains Mono' }}>
-                {prefix.length} points loaded{prefix.length > 160 && (
-                  <span style={{ color: 'rgba(255,140,0,0.7)' }}> — trimmed to last 160</span>
-                )}
-              </span>
-            </div>
-            <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }}
-              onClick={loadExample}>
-              📂 Load Example Data
+            {/* ── Advanced toggle ── */}
+            <button
+              onClick={() => setShowAdvanced(v => !v)}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer', padding: '6px 0 2px',
+                fontSize: 11, color: 'rgba(0,212,255,0.45)', display: 'flex', alignItems: 'center', gap: 4,
+              }}
+            >
+              {showAdvanced ? '▾' : '▸'} Advanced options
             </button>
-          </div>
 
-          {/* Batch mode toggle */}
-          <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: '12px 16px' }}>
-            <div style={{
-              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Layers size={13} color="rgba(0,212,255,0.6)" />
-                <div>
-                  <div style={{ fontSize: 12, color: 'rgba(0,212,255,0.7)', fontWeight: 600 }}>Batch Mode</div>
-                  <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.3)' }}>Generate N variations, pick best</div>
-                </div>
-              </div>
-              <button
-                onClick={() => setBatchMode(v => !v)}
-                style={{
-                  width: 44, height: 24, borderRadius: 12,
-                  background: batchMode ? 'rgba(180,74,255,0.25)' : 'rgba(0,212,255,0.08)',
-                  border: `1px solid ${batchMode ? 'rgba(180,74,255,0.4)' : 'rgba(0,212,255,0.15)'}`,
-                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s ease',
-                  boxShadow: batchMode ? '0 0 8px rgba(180,74,255,0.2)' : 'none',
-                }}
-              >
-                <div style={{
-                  width: 16, height: 16, borderRadius: '50%',
-                  background: batchMode ? '#b44aff' : 'rgba(126,200,227,0.3)',
-                  position: 'absolute', top: 3,
-                  left: batchMode ? 24 : 4,
-                  transition: 'all 0.2s ease',
-                  boxShadow: batchMode ? '0 0 6px #b44aff' : 'none',
-                }} />
-              </button>
-            </div>
-            {batchMode && (
-              <div style={{ marginTop: 10 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <label className="form-label" style={{ marginBottom: 0 }}>Count</label>
-                  <span style={{ fontFamily: 'JetBrains Mono', fontSize: 12, color: '#b44aff', fontWeight: 700 }}>{batchN}</span>
-                </div>
-                <input type="range" min={2} max={10} step={1}
-                  value={batchN} onChange={e => setBatchN(Number(e.target.value))}
-                  style={{ width: '100%', accentColor: '#b44aff' }} />
-              </div>
-            )}
-          </div>
-
-          {/* Tracking / prediction mode */}
-          <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: '12px 16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ fontSize: 13 }}>🎯</span>
-                <div>
-                  <div style={{ fontSize: 12, color: 'rgba(180,74,255,0.9)', fontWeight: 600 }}>Tracking Mode</div>
-                  <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.3)' }}>Predict moving target</div>
-                </div>
-              </div>
-              <button
-                onClick={() => setTrackingMode(v => !v)}
-                style={{
-                  width: 44, height: 24, borderRadius: 12,
-                  background: trackingMode ? 'rgba(180,74,255,0.25)' : 'rgba(0,212,255,0.08)',
-                  border: `1px solid ${trackingMode ? 'rgba(180,74,255,0.4)' : 'rgba(0,212,255,0.15)'}`,
-                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s',
-                }}>
-                <div style={{
-                  width: 16, height: 16, borderRadius: '50%',
-                  background: trackingMode ? '#b44aff' : 'rgba(126,200,227,0.3)',
-                  position: 'absolute', top: 3, left: trackingMode ? 24 : 4,
-                  transition: 'all 0.2s', boxShadow: trackingMode ? '0 0 6px #b44aff' : 'none',
-                }} />
-              </button>
-            </div>
-            {trackingMode && (
-              <div style={{ marginTop: 12 }}>
-                <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.45)', marginBottom: 8 }}>
-                  Velocity ({countsPerPixel ? 'px/sec' : 'counts/sec'})
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  {(['X', 'Y'] as const).map((axis, i) => (
-                    <div key={axis} style={{ flex: 1 }}>
-                      <div style={{ fontSize: 10, color: 'rgba(180,74,255,0.5)', marginBottom: 3 }}>{axis}</div>
-                      <input type="number" className="form-input"
-                        style={{ width: '100%', borderColor: 'rgba(180,74,255,0.3)' }}
-                        value={i === 0 ? velocityX : velocityY}
-                        onChange={e => i === 0 ? setVelocityX(Number(e.target.value)) : setVelocityY(Number(e.target.value))} />
-                    </div>
-                  ))}
-                </div>
-                {predictedTarget && (
-                  <div style={{
-                    marginTop: 8, padding: '6px 10px', borderRadius: 6,
-                    background: 'rgba(180,74,255,0.06)', border: '1px solid rgba(180,74,255,0.18)',
-                    fontFamily: 'JetBrains Mono', fontSize: 10, color: 'rgba(180,74,255,0.8)',
-                  }}>
-                    C′ = ({predictedTarget[0].toFixed(1)}, {predictedTarget[1].toFixed(1)}) in 256ms
-                  </div>
-                )}
-                {!fovConfig && (
-                  <div style={{ fontSize: 10, color: 'rgba(255,140,0,0.6)', marginTop: 6 }}>
-                    ⚠ Set FOV Scale in Settings for px/sec conversion
-                  </div>
-                )}
-
-                {/* Tracking priority settings (read from Settings) */}
-                <div style={{
-                  marginTop: 10, padding: '8px 10px', borderRadius: 6,
-                  background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
-                  display: 'flex', gap: 16, flexWrap: 'wrap',
-                }}>
-                  <div style={{ fontSize: 10 }}>
-                    <span style={{ color: 'rgba(126,200,227,0.35)' }}>Priority </span>
-                    <span style={{ color: '#00d4ff', fontFamily: 'JetBrains Mono', fontWeight: 600 }}>
-                      {distancePriority ? 'Nearest target' : 'First locked'}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: 10 }}>
-                    <span style={{ color: 'rgba(126,200,227,0.35)' }}>Switch delay </span>
-                    <span style={{ color: '#b44aff', fontFamily: 'JetBrains Mono', fontWeight: 600 }}>
-                      {switchDelayMs}ms
-                    </span>
-                  </div>
+            {showAdvanced && (<>
+              <InputRow label="Target Radius" hint="Acceptance radius in counts">
+                <input type="number" className="form-input" style={{ width: '100%' }} value={radius}
+                  onChange={e => setRadius(Number(e.target.value))} min={5} max={200} />
+              </InputRow>
+              <InputRow label="Progress Center" hint="0.6–0.8 recommended">
+                <input type="range" style={{ width: '100%', accentColor: '#00d4ff' }}
+                  value={progressCenter} min={0} max={1} step={0.05}
+                  onChange={e => setProgressCenter(Number(e.target.value))} />
+                <span style={{ fontSize: 12, color: '#00d4ff', fontFamily: 'JetBrains Mono' }}>
+                  {progressCenter.toFixed(2)}
+                </span>
+              </InputRow>
+              <div className="form-group">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                  <label className="form-label" style={{ marginBottom: 0 }}>Seed</label>
                   <button
+                    onClick={() => setSeedLocked(v => !v)}
                     style={{
-                      background: 'none', border: 'none', cursor: 'pointer',
-                      fontSize: 10, color: 'rgba(0,212,255,0.45)',
-                      textDecoration: 'underline', padding: 0, fontFamily: 'inherit',
-                    }}
-                    onClick={() => navigate('/settings')}
+                      cursor: 'pointer', padding: '2px 6px', borderRadius: 4,
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      fontSize: 10, color: seedLocked ? '#00d4ff' : 'rgba(126,200,227,0.4)',
+                      background: seedLocked ? 'rgba(0,212,255,0.08)' : 'rgba(0,212,255,0.03)',
+                      border: `1px solid ${seedLocked ? 'rgba(0,212,255,0.2)' : 'rgba(0,212,255,0.07)'}`,
+                    } as React.CSSProperties}
                   >
-                    Edit in Settings →
+                    {seedLocked ? <Lock size={11} /> : <Unlock size={11} />}
+                    {seedLocked ? 'locked' : 'random'}
                   </button>
                 </div>
+                <input type="number" className="form-input" style={{ width: '100%', opacity: seedLocked ? 1 : 0.5 }}
+                  value={seed} onChange={e => setSeed(Number(e.target.value))} disabled={!seedLocked} />
               </div>
-            )}
+              <div className="form-group">
+                <label className="form-label">Prefix Data (dx/dy JSON)</label>
+                <textarea
+                  style={{
+                    background: 'rgba(0,4,14,0.9)', border: '1px solid rgba(0,212,255,0.12)',
+                    borderRadius: 6, color: '#00ffcc', padding: '8px 12px', width: '100%',
+                    minHeight: 70, resize: 'vertical', fontFamily: 'JetBrains Mono, monospace',
+                    fontSize: 11, outline: 'none',
+                  }}
+                  value={prefixText}
+                  onChange={e => { setPrefixText(e.target.value); parsePrefixText(e.target.value) }}
+                  spellCheck={false}
+                />
+                {prefixError && <span style={{ color: '#ff2d78', fontSize: 11 }}>{prefixError}</span>}
+                <span style={{ fontSize: 11, color: 'rgba(0,212,255,0.4)', fontFamily: 'JetBrains Mono' }}>
+                  {prefix.length} pts{prefix.length > 160 && <span style={{ color: 'rgba(255,140,0,0.7)' }}> — trimmed to 160</span>}
+                </span>
+              </div>
+              <button className="btn btn-secondary" style={{ width: '100%', justifyContent: 'center' }}
+                onClick={loadExample}>
+                📂 Reload Example Data
+              </button>
+            </>)}
           </div>
 
           {/* Run inference */}
           <button className="btn btn-primary"
-            style={{ justifyContent: 'center', padding: '13px', fontSize: 13 }}
+            style={{ justifyContent: 'center', padding: '13px', fontSize: 14, fontWeight: 700 }}
             onClick={runInference} disabled={loading || !!prefixError}>
             {loading
-              ? <><span className="spinner" style={{ width: 15, height: 15 }} />
-                  {batchMode ? ` Running ${batchN} inferences…` : ' Running Inference…'}</>
-              : batchMode
-                ? `▶  Run ${batchN} Batch Inferences`
-                : '▶  Run Inference'}
+              ? <><span className="spinner" style={{ width: 15, height: 15 }} /> Generating…</>
+              : '▶  Generate Movement'}
           </button>
 
           {error && (
