@@ -39,6 +39,9 @@ function PixelConverter({ countsPerPixel, onConvert }: {
         }}
       >
         {open ? '▾' : '▸'} convert from pixels
+        <span style={{ color: 'rgba(0,212,255,0.3)', marginLeft: 6 }}>
+          ({countsPerPixel.toFixed(3)} cpp)
+        </span>
       </button>
       {open && (
         <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'flex-end' }}>
@@ -123,10 +126,34 @@ export default function Inference() {
       const saved = JSON.parse(localStorage.getItem('fov_config') || 'null')
       if (saved) return saved
     } catch {}
-    const defaults = { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 1920 }
+    const defaults = { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 }
     try { localStorage.setItem('fov_config', JSON.stringify(defaults)) } catch {}
     return defaults
   })
+
+  // Auto Target: receive live target pushes from external processes via WebSocket
+  const [autoTarget, setAutoTarget] = useState(false)
+
+  useEffect(() => {
+    if (!autoTarget) return
+    let sock: WebSocket | null = null
+    try {
+      sock = new WebSocket('ws://localhost:5000/socket.io/?EIO=4&transport=websocket')
+      sock.onmessage = (e) => {
+        const raw = e.data as string
+        if (raw === '2') { sock?.send('3'); return }
+        if (raw.startsWith('42')) {
+          try {
+            const [event, data] = JSON.parse(raw.slice(2))
+            if (event === 'target_update') {
+              setTarget([data.x, data.y])
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { /* WebSocket optional */ }
+    return () => { sock?.close() }
+  }, [autoTarget])
 
   // Tracking config from Settings
   const distancePriority = localStorage.getItem('target_distance_priority') !== 'false'
@@ -362,7 +389,25 @@ export default function Inference() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
             <div className="section-header">Parameters</div>
-            <XYInput label="Target Offset B→C (mouse counts)" value={target} onChange={setTarget} />
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <XYInput label="Target Offset B→C (mouse counts)" value={target} onChange={setTarget} />
+              </div>
+              <button
+                onClick={() => setAutoTarget(v => !v)}
+                title={autoTarget ? 'Disable auto-target feed' : 'Enable auto-target via WebSocket push'}
+                style={{
+                  marginTop: 22, padding: '5px 9px', fontSize: 10, borderRadius: 6,
+                  background: autoTarget ? 'rgba(57,255,20,0.12)' : 'rgba(0,212,255,0.06)',
+                  border: `1px solid ${autoTarget ? 'rgba(57,255,20,0.35)' : 'rgba(0,212,255,0.15)'}`,
+                  color: autoTarget ? '#39ff14' : 'rgba(0,212,255,0.5)',
+                  cursor: 'pointer', whiteSpace: 'nowrap', fontFamily: 'JetBrains Mono',
+                  boxShadow: autoTarget ? '0 0 8px rgba(57,255,20,0.15)' : 'none',
+                }}
+              >
+                {autoTarget ? '⚡ live' : '○ live'}
+              </button>
+            </div>
             <PixelConverter countsPerPixel={countsPerPixel} onConvert={setTarget} />
             <InputRow label="Target Radius" hint="Acceptance radius in counts">
               <input type="number" className="form-input" style={{ width: '100%' }} value={radius}

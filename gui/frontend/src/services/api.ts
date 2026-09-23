@@ -135,12 +135,15 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
 export const api = {
   // General
   health:      () => get<HealthResponse>('/health'),
+  warmup:      () => post<{ ok: boolean; latency_ms?: number; error?: string }>('/warmup'),
   models:      () => get<{ planners: unknown[]; renderers: unknown[] }>('/models'),
   exampleData: () => get<{
     prefix: [number, number][]; profile: number[][]
     target: [number, number]; target_radius: number
     progress_center: number; seed: number
   }>('/example-data'),
+  pushTarget:  (px_x: number, px_y: number, fov_config?: { dpi: number; sensitivity: number; fovH: number; screenW: number }) =>
+                 post<{ ok: boolean; counts: [number, number] }>('/target/push', { px_x, px_y, fov_config }),
 
   // Inference
   runInference:       (req: InferenceRequest) => post<InferenceResult>('/inference', req),

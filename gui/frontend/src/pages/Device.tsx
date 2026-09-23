@@ -196,6 +196,9 @@ export default function Device() {
       const result = await api.serial.connect({ port: selectedPort, baud: selectedBaud, protocol: selectedProto })
       if (result.ok) {
         addLog(`Connected to ${selectedPort}`, 'log-success')
+        api.warmup().then(r => {
+          if (r.ok) addLog(`Pipeline warmed up (${r.latency_ms}ms)`, 'log-dim')
+        }).catch(() => {})
       } else {
         addLog(`Connection failed: ${result.error}`, 'log-error')
       }
@@ -215,6 +218,9 @@ export default function Device() {
       const result = await api.serial.connectMakcu(selectedPort)
       if (result.ok) {
         addLog(`MAKCU connected on ${selectedPort} @ ${result.baud?.toLocaleString()} baud`, 'log-success')
+        api.warmup().then(r => {
+          if (r.ok) addLog(`Pipeline warmed up (${r.latency_ms}ms)`, 'log-dim')
+        }).catch(() => {})
       } else {
         addLog(`MAKCU Auto-Connect failed: ${result.error}`, 'log-error')
       }
@@ -268,6 +274,31 @@ export default function Device() {
       setReplayingMacro(false)
     }
   }
+
+  // Load default quickfire params from example data
+  const [loadingDefault, setLoadingDefault] = useState(false)
+  const loadDefaultParams = useCallback(async () => {
+    setLoadingDefault(true)
+    addLog('Loading default inference params from example data…', 'log-dim')
+    try {
+      const data = await api.exampleData()
+      const params = {
+        prefix:           data.prefix,
+        target:           data.target,
+        target_radius:    data.target_radius,
+        progress_center:  data.progress_center,
+        seed:             data.seed,
+        profile:          data.profile,
+      }
+      localStorage.setItem('quickfire_params', JSON.stringify(params))
+      setQuickfireParams(params)
+      addLog('✓ Default params loaded — Quick Fire is now armed', 'log-success')
+    } catch (e) {
+      addLog(`Failed to load default params: ${e}`, 'log-error')
+    } finally {
+      setLoadingDefault(false)
+    }
+  }, [addLog])
 
   // Quick Fire action
   const fireQuickFire = useCallback(async () => {
@@ -690,12 +721,23 @@ export default function Device() {
               <div style={{
                 background: 'rgba(255,140,0,0.04)', border: '1px solid rgba(255,140,0,0.12)',
                 borderRadius: 6, padding: '10px 12px', marginBottom: 14,
-                display: 'flex', alignItems: 'center', gap: 8,
               }}>
-                <AlertCircle size={13} color="rgba(255,140,0,0.6)" />
-                <span style={{ fontSize: 11, color: 'rgba(255,140,0,0.65)' }}>
-                  No quickfire params — run inference first
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <AlertCircle size={13} color="rgba(255,140,0,0.6)" />
+                  <span style={{ fontSize: 11, color: 'rgba(255,140,0,0.65)' }}>
+                    No quickfire params — run inference first, or load defaults
+                  </span>
+                </div>
+                <button
+                  className="btn btn-secondary"
+                  onClick={loadDefaultParams}
+                  disabled={loadingDefault}
+                  style={{ width: '100%', justifyContent: 'center', fontSize: 11 }}
+                >
+                  {loadingDefault
+                    ? <><span className="spinner" style={{ width: 12, height: 12 }} /> Loading…</>
+                    : '↓ Load Default Params'}
+                </button>
               </div>
             )}
 
@@ -725,7 +767,7 @@ export default function Device() {
             )}
             {connected && !quickfireParams && (
               <div style={{ fontSize: 11, color: 'rgba(255,140,0,0.7)', textAlign: 'center', marginTop: 7 }}>
-                Run inference first on the Inference page
+                Load defaults above or configure on the Inference page
               </div>
             )}
             {lastFiredTime && (

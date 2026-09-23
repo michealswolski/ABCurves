@@ -212,6 +212,48 @@ def models_info():
     })
 
 
+@app.route('/api/warmup', methods=['POST'])
+def warmup():
+    """Run a throwaway inference to warm up the pipeline and GPU kernels."""
+    if pipeline is None:
+        return jsonify({'ok': False, 'error': 'Pipeline not ready'}), 503
+    try:
+        np.random.seed(0)
+        prefix = np.random.randn(20, 2).astype(np.float32) * 3
+        t0 = time.time()
+        pipeline.generate(prefix, target_rel_at_B=(50, 0), target_radius=10, progress_center=0.5, seed=1)
+        ms = round((time.time() - t0) * 1000, 1)
+        return jsonify({'ok': True, 'latency_ms': ms})
+    except Exception as exc:
+        logger.warning("Warmup error: %s", exc)
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+# Shared live target pushed by external processes
+_live_target: dict = {}
+
+@app.route('/api/target/push', methods=['POST'])
+def push_target():
+    """Accept pixel coordinates (from an overlay/script), convert to counts, and emit via WebSocket."""
+    global _live_target
+    d = request.json or {}
+    px_x = float(d.get('px_x', 0))
+    px_y = float(d.get('px_y', 0))
+    fov_config = d.get('fov_config')  # optional: {dpi, sensitivity, fovH, screenW}
+    if fov_config:
+        dpi, sens = float(fov_config['dpi']), float(fov_config['sensitivity'])
+        fovH, screenW = float(fov_config['fovH']), float(fov_config['screenW'])
+        cpp = (dpi / 400) / (sens * 0.022) * (fovH / screenW)
+    else:
+        # Default CS2 @ 400 DPI, 3.2554 sens, 106.26 FOV, 2560 wide
+        cpp = (400 / 400) / (3.2554 * 0.022) * (106.26 / 2560)
+    cx = round(px_x * cpp)
+    cy = round(px_y * cpp)
+    _live_target = {'x': cx, 'y': cy, 'px_x': px_x, 'px_y': px_y}
+    socketio.emit('target_update', _live_target)
+    return jsonify({'ok': True, 'counts': [cx, cy]})
+
+
 @app.route('/api/example-data')
 def get_example_data():
     np.random.seed(42)
