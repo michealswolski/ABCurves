@@ -279,7 +279,7 @@ export default function MovementCanvas({
       // Label
       ctx.font = '10px "JetBrains Mono", monospace'
       ctx.fillStyle = 'rgba(180,74,255,0.7)'
-      ctx.fillText('C’ pred', ptx + rPx + 6, pty - 2)
+      ctx.fillText("C′ pred", ptx + rPx + 6, pty - 2)
       if (trackingVelocityCps) {
         ctx.fillStyle = 'rgba(180,74,255,0.45)'
         ctx.font = '9px "JetBrains Mono", monospace'
@@ -309,12 +309,10 @@ export default function MovementCanvas({
       [340, '#ff2d78', 'Target'],
     ].forEach(([lx, color, label]) => {
       ctx.fillStyle = color as string
-      ctx.fillRect(lx as number, ly - 5, 22, 2)
       ctx.shadowColor = color as string
-      ctx.shadowBlur = 4
-      ctx.fill()
+      ctx.shadowBlur = 6
+      ctx.fillRect(lx as number, ly - 5, 22, 2)
       ctx.shadowBlur = 0
-      ctx.fillStyle = (color as string).replace(')', ', 0.7)').replace('rgb', 'rgba') + ''
       ctx.fillStyle = 'rgba(200,230,240,0.55)'
       ctx.fillText(label as string, (lx as number) + 28, ly)
     })

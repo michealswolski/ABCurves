@@ -13,14 +13,6 @@ const TEXTURE_DATA = [
   { name: 'Random Walk', distance: 1.241, fill: '#ff5555' },
 ]
 
-const DETECTION_DATA = [
-  { name: 'ABCurves\n(Cold)', passRate: 0, failRate: 100 },
-  { name: 'ABCurves\n(Warm)', passRate: 14.2, failRate: 85.8 },
-  { name: 'Bezier', passRate: 38.1, failRate: 61.9 },
-  { name: 'Linear', passRate: 72.4, failRate: 27.6 },
-  { name: 'Random', passRate: 91.0, failRate: 9.0 },
-]
-
 const CUSTOM_TOOLTIP_STYLE: React.CSSProperties = {
   background: '#1e2040',
   border: '1px solid #2d3561',
@@ -30,43 +22,45 @@ const CUSTOM_TOOLTIP_STYLE: React.CSSProperties = {
   color: '#e2e8f0',
 }
 
-function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: { name: string; value: number; color: string }[]; label?: string }) {
+function ChartTooltip({ active, payload, label, pct }: { active?: boolean; payload?: { name: string; value: number; color: string }[]; label?: string; pct?: boolean }) {
   if (!active || !payload?.length) return null
   return (
     <div style={CUSTOM_TOOLTIP_STYLE}>
       <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
       {payload.map(p => (
-        <div key={p.name} style={{ color: p.color }}>{p.name}: {p.value.toFixed(3)}</div>
+        <div key={p.name} style={{ color: p.color }}>
+          {p.name}: {pct ? `${p.value.toFixed(1)}%` : p.value.toFixed(3)}
+        </div>
       ))}
     </div>
   )
 }
 
 export default function Metrics() {
-  const [benchmarks, setBenchmarks] = useState<{
-    profile_prep_ms?: number
-    first_report_ms?: number
-    median_ms?: number
-    p99_ms?: number
-  } | null>(null)
-  const [detection, setDetection] = useState<{
-    cold_pass_rate?: number
-    warm_pass_rate?: number
-  } | null>(null)
+  const [benchmarks, setBenchmarks] = useState<import('../services/api').BenchmarkResult | null>(null)
+  const [detection, setDetection] = useState<import('../services/api').DetectionStudy | null>(null)
 
   useEffect(() => {
     api.benchmarks().then(setBenchmarks).catch(() => null)
     api.detectionStudy().then(setDetection).catch(() => null)
   }, [])
 
-  const B = benchmarks ?? { profile_prep_ms: 0.18, first_report_ms: 0.24, median_ms: 0.24, p99_ms: 0.48 }
-  const D = detection ?? { cold_pass_rate: 0, warm_pass_rate: 14.2 }
+  // Map backend response shape to flat values with fallbacks
+  const B = {
+    profile_prep_ms: benchmarks?.first_report?.median_ms ?? 0.18,
+    first_report_ms: benchmarks?.first_report?.median_ms  ?? 0.24,
+    median_ms:       benchmarks?.renderer_profile?.median_ms ?? 0.24,
+    p99_ms:          benchmarks?.renderer_profile?.p99_ms    ?? 0.48,
+  }
+
+  const coldRate  = detection ? detection.cold_test.detection_rate * 100  : 0
+  const warmRate  = detection ? detection.warm_test.detection_rate * 100   : 14.2
 
   const detDisplayData = [
-    { name: 'ABCurves (Cold)', passRate: D.cold_pass_rate ?? 0, failRate: 100 - (D.cold_pass_rate ?? 0) },
-    { name: 'ABCurves (Warm)', passRate: D.warm_pass_rate ?? 14.2, failRate: 100 - (D.warm_pass_rate ?? 14.2) },
-    { name: 'Bezier Spline', passRate: 38.1, failRate: 61.9 },
-    { name: 'Linear Interp', passRate: 72.4, failRate: 27.6 },
+    { name: 'ABCurves (Cold)', detectionRate: coldRate, passRate: 100 - coldRate },
+    { name: 'ABCurves (Warm)', detectionRate: warmRate, passRate: 100 - warmRate },
+    { name: 'Bezier Spline',   detectionRate: 38.1, passRate: 61.9 },
+    { name: 'Linear Interp',   detectionRate: 72.4, passRate: 27.6 },
   ]
 
   return (
@@ -112,10 +106,10 @@ export default function Metrics() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(74,144,226,0.08)" />
               <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 10 }} />
               <YAxis tickFormatter={v => `${v}%`} tick={{ fill: '#94a3b8', fontSize: 11 }} />
-              <Tooltip content={<ChartTooltip />} formatter={(v: number) => [`${v.toFixed(1)}%`]} />
+              <Tooltip content={<ChartTooltip pct />} />
               <Legend wrapperStyle={{ fontSize: 12, color: '#94a3b8' }} />
-              <Bar dataKey="passRate" name="Detection Rate %" fill="#ff5555" fillOpacity={0.8} radius={[4, 4, 0, 0]} />
-              <Bar dataKey="failRate" name="Pass Rate %" fill="#50fa7b" fillOpacity={0.5} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="detectionRate" name="Detection Rate %" fill="#ff5555" fillOpacity={0.8} radius={[4, 4, 0, 0]} />
+              <Bar dataKey="passRate" name="Pass Rate %" fill="#50fa7b" fillOpacity={0.5} radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
           <div style={{ marginTop: 10, padding: '8px 12px', background: 'rgba(80,250,123,0.06)', borderRadius: 6, fontSize: 12 }}>

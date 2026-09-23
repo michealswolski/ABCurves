@@ -90,21 +90,23 @@ def run_inference():
         prog_center   = float(data.get('progress_center', 0.72))
         seed          = int(data.get('seed', 2026))
 
+        if pipeline is None:
+            return jsonify({'error': 'Pipeline not ready — model weights not loaded'}), 503
+
         t0 = time.time()
-        with Pipeline.from_pretrained() as pipe:
-            renderer_profile = None
-            if data.get('profile'):
-                prof = np.array(data['profile'], dtype=np.int16)
-                if prof.shape == (256, 2):
-                    renderer_profile = pipe.prepare_renderer_profile(prof)
-            counts = pipe.generate(
-                prefix,
-                renderer_profile=renderer_profile,
-                target_rel_at_B=target_rel,
-                target_radius=target_radius,
-                progress_center=prog_center,
-                seed=seed,
-            )
+        renderer_profile = None
+        if data.get('profile'):
+            prof = np.array(data['profile'], dtype=np.int16)
+            if prof.shape == (256, 2):
+                renderer_profile = pipeline.prepare_renderer_profile(prof)
+        counts = pipeline.generate(
+            prefix,
+            renderer_profile=renderer_profile,
+            target_rel_at_B=target_rel,
+            target_radius=target_radius,
+            progress_center=prog_center,
+            seed=seed,
+        )
         latency_ms = round((time.time() - t0) * 1000, 2)
 
         entry = {
@@ -165,24 +167,26 @@ def run_inference_batch():
         prog_center   = float(data.get('progress_center', 0.72))
         base_seed     = int(data.get('seed', 2026))
 
+        if pipeline is None:
+            return jsonify({'error': 'Pipeline not ready — model weights not loaded'}), 503
+
         results = []
-        with Pipeline.from_pretrained() as pipe:
-            for i in range(n):
-                t0 = time.time()
-                counts = pipe.generate(
-                    prefix,
-                    target_rel_at_B=target_rel,
-                    target_radius=target_radius,
-                    progress_center=prog_center,
-                    seed=base_seed + i,
-                )
-                results.append({
-                    'index':        i,
-                    'seed':         base_seed + i,
-                    'latency_ms':   round((time.time() - t0) * 1000, 2),
-                    'continuation': counts.tolist(),
-                    'length':       len(counts),
-                })
+        for i in range(n):
+            t0 = time.time()
+            counts = pipeline.generate(
+                prefix,
+                target_rel_at_B=target_rel,
+                target_radius=target_radius,
+                progress_center=prog_center,
+                seed=base_seed + i,
+            )
+            results.append({
+                'index':        i,
+                'seed':         base_seed + i,
+                'latency_ms':   round((time.time() - t0) * 1000, 2),
+                'continuation': counts.tolist(),
+                'length':       len(counts),
+            })
         return jsonify({'success': True, 'n': n, 'results': results})
     except Exception as exc:
         logger.error("Batch inference error: %s", exc)
@@ -291,7 +295,8 @@ def serial_send_reports():
     # Run transmission in a background thread so we can stream progress.
     def do_send():
         def progress(sent, total):
-            if sent % 50 == 0 or sent == total:
+            # Emit every 10 reports (smooth progress for 256-report sequences) + always on last
+            if sent % 10 == 0 or sent == total:
                 socketio.emit('serial_progress', {
                     'sent': sent, 'total': total,
                     'pct': round(sent / total * 100, 1),
@@ -357,16 +362,27 @@ def serial_macro_replay():
 #  Training config
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_training_config = {
+    'planner':  {'epochs': 100, 'batch_size': 32, 'learning_rate': 0.001, 'heads': 16},
+    'renderer': {'epochs': 50,  'batch_size': 64,  'learning_rate': 0.0005, 'hidden_size': 128},
+}
+
 @app.route('/api/training/config', methods=['GET', 'POST'])
 def training_config():
+    global _training_config
     if request.method == 'GET':
-        return jsonify({
-            'planner':  {'epochs': 100, 'batch_size': 32,
-                         'learning_rate': 0.001, 'heads': 16},
-            'renderer': {'epochs': 50,  'batch_size': 64,
-                         'learning_rate': 0.0005, 'hidden_size': 128},
-        })
-    return jsonify({'success': True, 'config': request.json})
+        return jsonify(_training_config)
+    payload = request.json or {}
+    # Accept either a full wrapper {"planner":{...},"renderer":{...}} or a single model dict
+    if 'planner' in payload or 'renderer' in payload:
+        _training_config.update(payload)
+    else:
+        # Single-model update: merge into whichever key the caller intends
+        for key in ('planner', 'renderer'):
+            if any(k in payload for k in _training_config.get(key, {})):
+                _training_config[key].update(payload)
+                break
+    return jsonify({'success': True, 'config': _training_config})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

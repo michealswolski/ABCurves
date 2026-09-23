@@ -172,6 +172,8 @@ export default function Inference() {
       sock = new WebSocket('ws://localhost:5000/socket.io/?EIO=4&transport=websocket')
       sock.onmessage = (e) => {
         const raw = e.data as string
+        // Respond to Socket.IO ping frames to keep the connection alive
+        if (raw === '2') { sock?.send('3'); return }
         if (!raw.startsWith('42')) return
         try {
           const [event, data] = JSON.parse(raw.slice(2))
@@ -270,10 +272,12 @@ export default function Inference() {
 
   const sendToMakcu = useCallback(async () => {
     if (!result?.continuation) return
-    setSending(true); setSendProgress(null)
+    setSending(true); setSendProgress(null); setError('')
     try {
-      await api.serial.sendReports(result.continuation as [number, number][], intervalMs)
-    } catch {
+      const res = await api.serial.sendReports(result.continuation as [number, number][], intervalMs)
+      if (!res.ok) setError((res as any).error ?? 'Send failed')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Send to MAKCU failed')
       setSending(false)
     }
   }, [result, intervalMs])

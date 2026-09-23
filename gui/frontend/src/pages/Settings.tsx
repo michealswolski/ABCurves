@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react'
 import { Settings as SettingsIcon, Sun, Moon, Sliders, Terminal, CheckCircle2, Crosshair } from 'lucide-react'
 
-const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]
+const BAUDS = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 4000000]
 
 const FOV_PRESETS = [
   { id: 'cs2',       label: 'CS2',      sensitivity: 3.2554, fovH: 106.26 },
@@ -26,7 +26,7 @@ export default function Settings() {
     (localStorage.getItem('theme') || 'dark') as 'dark' | 'light'
   )
   const [defaultBaud, setDefaultBaud] = useState<number>(() =>
-    Number(localStorage.getItem('defaultBaud') || 115200)
+    Number(localStorage.getItem('defaultBaud') || 921600)
   )
   const [pythonPath, setPythonPath] = useState(() =>
     localStorage.getItem('pythonPath') || ''

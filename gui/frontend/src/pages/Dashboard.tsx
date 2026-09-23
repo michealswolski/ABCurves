@@ -10,6 +10,7 @@ import { api, LatencyEntry, ModelInfo, DetectionStudy, BenchmarkResult } from '.
 export default function Dashboard() {
   const navigate = useNavigate()
   const [serverOnline, setServerOnline] = useState<boolean | null>(null)
+  const [pipelineReady, setPipelineReady] = useState(false)
   const [latencies, setLatencies] = useState<LatencyEntry[]>([])
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null)
   const [detection, setDetection] = useState<DetectionStudy | null>(null)
@@ -17,8 +18,8 @@ export default function Dashboard() {
 
   useEffect(() => {
     api.health()
-      .then(() => setServerOnline(true))
-      .catch(() => setServerOnline(false))
+      .then(h => { setServerOnline(true); setPipelineReady(!!(h as any).pipeline_ready) })
+      .catch(() => { setServerOnline(false); setPipelineReady(false) })
 
     api.modelsInfo()
       .then(info => setModelInfo(info))
@@ -99,7 +100,7 @@ export default function Dashboard() {
           <span>
             {serverOnline === null ? '⟳ Connecting to backend…'
              : serverOnline
-               ? '✓ Backend connected · localhost:5000 · Pipeline ready'
+               ? `✓ Backend connected · localhost:5000 · ${pipelineReady ? 'Pipeline ready' : 'Pipeline loading…'}`
                : '✗ Backend offline · Start Flask server: python gui/backend/app.py'}
           </span>
         </div>
@@ -143,8 +144,8 @@ export default function Dashboard() {
           value={latencies.length > 0
             ? `${(latencies.reduce((s, e) => s + e.ms, 0) / latencies.length).toFixed(0)}ms`
             : (() => {
-                const us = (benchmarks as any)?.b_to_stream_ready_us?.p50
-                return us != null ? `${(us / 1000).toFixed(3)}ms` : '—'
+                const median = benchmarks?.renderer_profile?.median_ms
+                return median != null ? `${median.toFixed(1)}ms` : '—'
               })()}
           subtitle={latencies.length > 0 ? `avg over ${latencies.length} runs` : 'Benchmark (no runs yet)'}
           icon={<Zap size={20} />}
@@ -152,8 +153,8 @@ export default function Dashboard() {
           trend={latencies.length > 0
             ? { direction: 'neutral', label: `last: ${latencies[latencies.length - 1].ms}ms` }
             : (() => {
-                const us = (benchmarks as any)?.b_to_stream_ready_us?.p99
-                return us != null ? { direction: 'neutral' as const, label: `p99: ${(us / 1000).toFixed(3)}ms` } : undefined
+                const p99 = benchmarks?.renderer_profile?.p99_ms
+                return p99 != null ? { direction: 'neutral' as const, label: `p99: ${p99.toFixed(1)}ms` } : undefined
               })()}
         />
       </div>

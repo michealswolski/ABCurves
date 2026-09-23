@@ -91,6 +91,8 @@ export default function Device() {
       sock = new WebSocket('ws://localhost:5000/socket.io/?EIO=4&transport=websocket')
       sock.onmessage = (e) => {
         const raw = e.data as string
+        // Respond to Socket.IO ping frames to keep the connection alive
+        if (raw === '2') { sock?.send('3'); return }
         if (raw.startsWith('42')) {
           try {
             const [event, data] = JSON.parse(raw.slice(2))
@@ -178,36 +180,50 @@ export default function Device() {
     if (!selectedPort) { addLog('Select a port first', 'log-warn'); return }
     setConnecting(true)
     addLog(`Connecting to ${selectedPort} @ ${selectedBaud} baud (${selectedProto})…`)
-    const result = await api.serial.connect({ port: selectedPort, baud: selectedBaud, protocol: selectedProto })
-    if (result.ok) {
-      addLog(`Connected to ${selectedPort}`, 'log-success')
-    } else {
-      addLog(`Connection failed: ${result.error}`, 'log-error')
+    try {
+      const result = await api.serial.connect({ port: selectedPort, baud: selectedBaud, protocol: selectedProto })
+      if (result.ok) {
+        addLog(`Connected to ${selectedPort}`, 'log-success')
+      } else {
+        addLog(`Connection failed: ${result.error}`, 'log-error')
+      }
+      await refreshStatus()
+    } catch {
+      addLog('Connection failed: backend not reachable', 'log-error')
+    } finally {
+      setConnecting(false)
     }
-    await refreshStatus()
-    setConnecting(false)
   }
 
   const handleConnectMakcu = async () => {
     if (!selectedPort) { addLog('Select a port first', 'log-warn'); return }
     setConnecting(true)
     addLog(`MAKCU Auto-Connect: trying 4 Mbaud → 115200 negotiation on ${selectedPort}…`)
-    const result = await api.serial.connectMakcu(selectedPort)
-    if (result.ok) {
-      addLog(`MAKCU connected on ${selectedPort} @ ${result.baud?.toLocaleString()} baud`, 'log-success')
-    } else {
-      addLog(`MAKCU Auto-Connect failed: ${result.error}`, 'log-error')
+    try {
+      const result = await api.serial.connectMakcu(selectedPort)
+      if (result.ok) {
+        addLog(`MAKCU connected on ${selectedPort} @ ${result.baud?.toLocaleString()} baud`, 'log-success')
+      } else {
+        addLog(`MAKCU Auto-Connect failed: ${result.error}`, 'log-error')
+      }
+      await refreshStatus()
+    } catch {
+      addLog('MAKCU Auto-Connect failed: backend not reachable', 'log-error')
+    } finally {
+      setConnecting(false)
     }
-    await refreshStatus()
-    setConnecting(false)
   }
 
   const handleDisconnect = async () => {
     addLog('Disconnecting…', 'log-dim')
-    await api.serial.disconnect()
-    wasConnectedRef.current = false
-    await refreshStatus()
-    addLog('Disconnected', 'log-warn')
+    try {
+      await api.serial.disconnect()
+      wasConnectedRef.current = false
+      await refreshStatus()
+      addLog('Disconnected', 'log-warn')
+    } catch {
+      addLog('Disconnect failed: backend not reachable', 'log-error')
+    }
   }
 
   const connected = status?.connected ?? false
@@ -258,10 +274,10 @@ export default function Device() {
     setFiring(true)
     try {
       addLog('⚡ Quick Fire: running inference…', 'log-dim')
-      const result = await (api as any).runInference(params)
+      const result = await api.runInference(params)
       if (connected) {
         addLog('Sending reports to MAKCU…', 'log-dim')
-        await (api.serial as any).sendReports(result.continuation, 1.0)
+        await api.serial.sendReports(result.continuation as [number, number][], 1.0)
         addLog('✓ Quick Fire complete!', 'log-success')
       } else {
         addLog('Inference complete but device not connected — reports not sent', 'log-warn')

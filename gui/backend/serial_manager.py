@@ -78,7 +78,7 @@ class SerialStats:
     start_time: float = field(default_factory=time.time)
 
     def rate_bps(self) -> float:
-        elapsed = time.time() - self.start_time or 1e-9
+        elapsed = max(time.time() - self.start_time, 1e-9)
         return self.bytes_sent / elapsed
 
     def to_dict(self) -> dict:
@@ -253,9 +253,10 @@ class SerialManager:
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
+        sent_ok = len(reports) - errors
         return {
             "ok":           errors == 0,
-            "reports_sent": len(reports),
+            "reports_sent": sent_ok,
             "errors":       errors,
             "stats":        self._stats.to_dict(),
         }

@@ -128,7 +128,7 @@ export default function About() {
           <div className="card">
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               <a
-                href="https://github.com"
+                href="https://github.com/terrafirma2021/makcu-docs"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{
@@ -173,7 +173,7 @@ export default function About() {
       </div>
 
       <div className="card" style={{ textAlign: 'center', padding: '20px', color: 'var(--text-muted)', fontSize: 12 }}>
-        ABCurves GUI v0.1.0 · Academic Research Project · Not for production use without ethics review
+        ABCurves GUI v1.6.0 · Academic Research Project · Not for production use without ethics review
       </div>
     </div>
   )

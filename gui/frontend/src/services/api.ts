@@ -85,7 +85,7 @@ export interface SerialStatus {
 export interface SerialConnectRequest {
   port:     string
   baud:     number
-  protocol: 'text' | 'ch9329' | 'raw_binary'
+  protocol: 'makcu' | 'text' | 'ch9329' | 'raw_binary'
 }
 
 export interface TrainingConfig {
