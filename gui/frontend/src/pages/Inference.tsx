@@ -379,6 +379,41 @@ export default function Inference() {
 
         {/* ── Controls ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+          {/* ── Quick Presets ── */}
+          <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: '12px 16px' }}>
+            <div className="section-header" style={{ marginBottom: 10 }}>Quick Presets</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {[
+                { label: 'Close Target',  desc: '~100px away',  x: 58,  y: -30, ms: 80  },
+                { label: 'Medium Target', desc: '~250px away',  x: 145, y: -70, ms: 110 },
+                { label: 'Far Target',    desc: '~500px away',  x: 290, y: -140, ms: 150 },
+                { label: 'Flick Right',   desc: 'wide flick',   x: 420, y: 0,   ms: 90  },
+              ].map(p => (
+                <button
+                  key={p.label}
+                  onClick={() => {
+                    setTarget([p.x, p.y])
+                    saveMaxMs(p.ms)
+                  }}
+                  style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    padding: '8px 12px', borderRadius: 6, cursor: 'pointer', textAlign: 'left',
+                    background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
+                    color: '#00d4ff', fontSize: 12, transition: 'all 0.15s',
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = 'rgba(0,212,255,0.09)')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'rgba(0,212,255,0.04)')}
+                >
+                  <span style={{ fontWeight: 600 }}>{p.label}</span>
+                  <span style={{ fontSize: 10, color: 'rgba(126,200,227,0.45)', fontFamily: 'JetBrains Mono' }}>
+                    {p.desc} · {p.ms}ms
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
 
             {/* ── Target ── */}
