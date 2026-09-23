@@ -165,6 +165,7 @@ export const api = {
                    post<{ ok: boolean; error?: string }>('/serial/click', { button }),
     resetStats:   () => post<{ ok: boolean }>('/serial/reset-stats'),
     reconnect:    () => post<{ ok: boolean; error?: string }>('/serial/reconnect'),
+    test:         (jog = 5) => post<{ ok: boolean; message?: string; error?: string }>('/serial/test', { jog }),
     replayMacro:  (events: MacroEvent[]) =>
                     post<{ ok: boolean; message: string; total: number }>(
                       '/serial/macro/replay', { events }),

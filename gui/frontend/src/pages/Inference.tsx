@@ -122,11 +122,14 @@ export default function Inference() {
       const saved = JSON.parse(localStorage.getItem('fov_config') || 'null')
       if (saved) return saved
     } catch {}
-    // Write and return defaults so the FOV circle shows even before Settings is visited
     const defaults = { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 1920 }
     try { localStorage.setItem('fov_config', JSON.stringify(defaults)) } catch {}
     return defaults
   })
+
+  // Tracking config from Settings
+  const distancePriority = localStorage.getItem('target_distance_priority') !== 'false'
+  const switchDelayMs = Number(localStorage.getItem('target_switch_delay_ms') || 200)
 
   const countsPerPixel = useMemo(() => {
     if (!fovConfig) return null
@@ -524,6 +527,36 @@ export default function Inference() {
                     ⚠ Set FOV Scale in Settings for px/sec conversion
                   </div>
                 )}
+
+                {/* Tracking priority settings (read from Settings) */}
+                <div style={{
+                  marginTop: 10, padding: '8px 10px', borderRadius: 6,
+                  background: 'rgba(0,212,255,0.04)', border: '1px solid rgba(0,212,255,0.1)',
+                  display: 'flex', gap: 16, flexWrap: 'wrap',
+                }}>
+                  <div style={{ fontSize: 10 }}>
+                    <span style={{ color: 'rgba(126,200,227,0.35)' }}>Priority </span>
+                    <span style={{ color: '#00d4ff', fontFamily: 'JetBrains Mono', fontWeight: 600 }}>
+                      {distancePriority ? 'Nearest target' : 'First locked'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 10 }}>
+                    <span style={{ color: 'rgba(126,200,227,0.35)' }}>Switch delay </span>
+                    <span style={{ color: '#b44aff', fontFamily: 'JetBrains Mono', fontWeight: 600 }}>
+                      {switchDelayMs}ms
+                    </span>
+                  </div>
+                  <button
+                    style={{
+                      background: 'none', border: 'none', cursor: 'pointer',
+                      fontSize: 10, color: 'rgba(0,212,255,0.45)',
+                      textDecoration: 'underline', padding: 0, fontFamily: 'inherit',
+                    }}
+                    onClick={() => navigate('/settings')}
+                  >
+                    Edit in Settings →
+                  </button>
+                </div>
               </div>
             )}
           </div>

@@ -48,11 +48,23 @@ export default function Device() {
   const [firing, setFiring] = useState(false)
   const [lastFiredTime, setLastFiredTime] = useState<string | null>(null)
 
-  // Hotkey
+  // Quick Fire hotkey
   const [hotkeyKey, setHotkeyKey] = useState<string>(
     () => localStorage.getItem('quickfire_hotkey') || 'F1'
   )
   const [capturingHotkey, setCapturingHotkey] = useState(false)
+
+  // Triggerbot state (synced from Settings)
+  const [triggerEnabled, setTriggerEnabled] = useState(() =>
+    localStorage.getItem('triggerbot_enabled') === 'true')
+  const [triggerMode] = useState<'manual' | 'magnet' | 'track'>(() =>
+    (localStorage.getItem('triggerbot_mode') as any) || 'manual')
+  const [reactionTimeMs] = useState(() =>
+    Number(localStorage.getItem('triggerbot_reaction_ms') || 50))
+  const [triggerbotHotkey] = useState(() =>
+    localStorage.getItem('triggerbot_hotkey') || 'Mouse4')
+  const [triggerFiring, setTriggerFiring] = useState(false)
+  const [testingConn, setTestingConn] = useState(false)
 
   // Keep refs in sync
   useEffect(() => { macroRecordingRef.current = macroRecording }, [macroRecording])
@@ -290,28 +302,106 @@ export default function Device() {
     }
   }, [connected, addLog])
 
-  // Hotkey listener: capture new hotkey OR trigger Quick Fire on configured key
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (capturingHotkey) {
-        if (['Escape', 'Tab', 'Enter'].includes(e.key)) return
-        e.preventDefault()
-        localStorage.setItem('quickfire_hotkey', e.key)
-        setHotkeyKey(e.key)
-        setCapturingHotkey(false)
-        return
+  // Test connection — send a tiny jog to verify device is alive
+  const handleTestConnection = useCallback(async () => {
+    setTestingConn(true)
+    addLog('Testing connection — jogging cursor 5 px right → left…', 'log-dim')
+    try {
+      const r = await api.serial.test(5)
+      if (r.ok) addLog('✓ Test passed — device is responding correctly!', 'log-success')
+      else addLog(`✗ Test failed: ${r.error}`, 'log-error')
+    } catch {
+      addLog('Test failed: backend not reachable', 'log-error')
+    } finally {
+      setTestingConn(false)
+    }
+  }, [addLog])
+
+  // Triggerbot fire
+  const fireTriggerbot = useCallback(async () => {
+    if (!connected || triggerFiring) return
+    setTriggerFiring(true)
+    addLog(`⚡ Triggerbot (${triggerMode}) — reaction ${reactionTimeMs}ms…`, 'log-dim')
+    try {
+      if (reactionTimeMs > 0) await new Promise(r => setTimeout(r, reactionTimeMs))
+      if (triggerMode === 'manual' || triggerMode === 'magnet') {
+        await api.serial.click('left')
+        addLog('✓ Triggerbot: click sent', 'log-success')
+      } else {
+        // track mode: run inference → send → click
+        const paramsStr = localStorage.getItem('quickfire_params')
+        if (!paramsStr) { addLog('Track+Fire: no quickfire params — run inference first', 'log-warn'); return }
+        const params = JSON.parse(paramsStr)
+        const result = await api.runInference(params)
+        await api.serial.sendReports(result.continuation as [number, number][], 1.0)
+        await new Promise(r => setTimeout(r, 50))
+        await api.serial.click('left')
+        addLog('✓ Track+Fire: aim + click sent', 'log-success')
       }
+    } catch (e) {
+      addLog(`Triggerbot error: ${e}`, 'log-error')
+    } finally {
+      setTriggerFiring(false)
+    }
+  }, [connected, triggerFiring, triggerMode, reactionTimeMs, addLog])
+
+  // Hotkey listener: Quick Fire + Triggerbot — supports keyboard and mouse buttons
+  useEffect(() => {
+    if (capturingHotkey) return  // handled separately below
+
+    const handleKey = (e: KeyboardEvent) => {
       if (e.key === hotkeyKey) {
         const paramsStr = localStorage.getItem('quickfire_params')
-        if (connected && paramsStr) {
-          e.preventDefault()
-          fireQuickFire()
-        }
+        if (connected && paramsStr) { e.preventDefault(); fireQuickFire() }
+      }
+      if (e.key === triggerbotHotkey && triggerEnabled) {
+        e.preventDefault(); fireTriggerbot()
       }
     }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [connected, hotkeyKey, capturingHotkey, fireQuickFire])
+    const handleMouse = (e: MouseEvent) => {
+      const labels = ['Mouse1', 'Mouse3', 'Mouse2', 'Mouse4', 'Mouse5']
+      const btn = labels[e.button] ?? `Mouse${e.button + 1}`
+      if (btn === hotkeyKey) {
+        const paramsStr = localStorage.getItem('quickfire_params')
+        if (connected && paramsStr) { e.preventDefault(); fireQuickFire() }
+      }
+      if (btn === triggerbotHotkey && triggerEnabled) {
+        e.preventDefault(); fireTriggerbot()
+      }
+    }
+    window.addEventListener('keydown', handleKey)
+    window.addEventListener('mousedown', handleMouse, true)
+    return () => {
+      window.removeEventListener('keydown', handleKey)
+      window.removeEventListener('mousedown', handleMouse, true)
+    }
+  }, [connected, hotkeyKey, triggerbotHotkey, triggerEnabled, capturingHotkey, fireQuickFire, fireTriggerbot])
+
+  // Hotkey capture (keyboard + mouse)
+  useEffect(() => {
+    if (!capturingHotkey) return
+    const onKey = (e: KeyboardEvent) => {
+      if (['Escape', 'Tab', 'Enter'].includes(e.key)) { setCapturingHotkey(false); return }
+      e.preventDefault()
+      localStorage.setItem('quickfire_hotkey', e.key)
+      setHotkeyKey(e.key)
+      setCapturingHotkey(false)
+    }
+    const onMouse = (e: MouseEvent) => {
+      e.preventDefault(); e.stopPropagation()
+      const labels = ['Mouse1', 'Mouse3', 'Mouse2', 'Mouse4', 'Mouse5']
+      const btn = labels[e.button] ?? `Mouse${e.button + 1}`
+      localStorage.setItem('quickfire_hotkey', btn)
+      setHotkeyKey(btn)
+      setCapturingHotkey(false)
+    }
+    window.addEventListener('keydown', onKey, true)
+    window.addEventListener('mousedown', onMouse, true)
+    return () => {
+      window.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('mousedown', onMouse, true)
+    }
+  }, [capturingHotkey])
 
   const armed = connected && quickfireParams !== null
 
@@ -471,12 +561,22 @@ export default function Device() {
                     ? <><span className="spinner" style={{ width: 14, height: 14 }} /> Connecting…</>
                     : <><Zap size={14} /> {selectedProto === 'makcu' ? 'Manual' : 'Connect'}</>}
                 </button>
-              </>) : (
+              </>) : (<>
                 <button className="btn btn-danger" onClick={handleDisconnect}
                   style={{ flex: 1, justifyContent: 'center' }}>
                   <ZapOff size={14} /> Disconnect
                 </button>
-              )}
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleTestConnection}
+                  disabled={testingConn}
+                  title="Send a tiny jog to verify the device is responding"
+                  style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+                  {testingConn
+                    ? <><span className="spinner" style={{ width: 12, height: 12 }} /> Testing…</>
+                    : '⚙ Test'}
+                </button>
+              </>)}
               <button className="btn btn-secondary" onClick={refreshStatus}>
                 <RefreshCw size={14} />
               </button>
@@ -652,7 +752,7 @@ export default function Device() {
           {/* Activation Hotkey card */}
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
             <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span>Activation Hotkey</span>
+              <span>Quick Fire Hotkey</span>
               {armed && (
                 <span style={{
                   fontSize: 9, padding: '2px 7px', borderRadius: 10,
@@ -666,18 +766,17 @@ export default function Device() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, color: 'rgba(0,212,255,0.7)', marginBottom: 3 }}>
-                  Press this key to trigger Quick Fire globally
+                  Keyboard key or mouse button to trigger Quick Fire
                 </div>
                 <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)' }}>
-                  Active when device is connected and params are loaded
+                  Supports keyboard (F1–F12, any key) and mouse buttons (Mouse1–Mouse5)
                 </div>
               </div>
-              {/* Current hotkey badge */}
               <div style={{
                 padding: '6px 14px', borderRadius: 6,
                 background: 'rgba(0,212,255,0.08)', border: '1px solid rgba(0,212,255,0.22)',
                 fontFamily: 'JetBrains Mono', fontSize: 14, fontWeight: 700,
-                color: '#00d4ff', minWidth: 48, textAlign: 'center',
+                color: '#00d4ff', minWidth: 60, textAlign: 'center',
                 boxShadow: '0 0 10px rgba(0,212,255,0.08)',
               }}>
                 {hotkeyKey}
@@ -692,7 +791,7 @@ export default function Device() {
                   fontSize: 12, color: '#00d4ff', textAlign: 'center',
                   animation: 'pulse-dot 1s ease-in-out infinite',
                 }}>
-                  Press any key… (Esc / Tab / Enter to cancel)
+                  ⏺ Press any key or click any mouse button… (Esc to cancel)
                 </div>
               ) : (
                 <button
@@ -704,6 +803,85 @@ export default function Device() {
                 </button>
               )}
             </div>
+          </div>
+
+          {/* Triggerbot */}
+          <div className="card" style={{
+            background: 'rgba(5,5,18,0.9)',
+            border: triggerEnabled ? '1px solid rgba(255,140,0,0.3)' : undefined,
+          }}>
+            <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: triggerEnabled ? '#ff8c00' : undefined }}>⚡ Triggerbot</span>
+              <span style={{ fontSize: 9, fontFamily: 'JetBrains Mono', color: 'rgba(126,200,227,0.3)', marginLeft: 'auto' }}>
+                Configure in Settings
+              </span>
+              <button
+                onClick={() => { const n = !triggerEnabled; setTriggerEnabled(n); localStorage.setItem('triggerbot_enabled', String(n)) }}
+                style={{
+                  width: 40, height: 22, borderRadius: 11,
+                  background: triggerEnabled ? 'rgba(255,140,0,0.2)' : 'rgba(0,212,255,0.06)',
+                  border: `1px solid ${triggerEnabled ? 'rgba(255,140,0,0.4)' : 'rgba(0,212,255,0.12)'}`,
+                  cursor: 'pointer', position: 'relative', transition: 'all 0.2s',
+                }}>
+                <div style={{
+                  width: 14, height: 14, borderRadius: '50%',
+                  background: triggerEnabled ? '#ff8c00' : 'rgba(126,200,227,0.3)',
+                  position: 'absolute', top: 3, left: triggerEnabled ? 22 : 3,
+                  transition: 'all 0.2s', boxShadow: triggerEnabled ? '0 0 6px #ff8c00' : 'none',
+                }} />
+              </button>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, marginBottom: 12 }}>
+              {([
+                { v: 'manual', label: 'Manual',  color: '#00d4ff' },
+                { v: 'magnet', label: 'Magnet',  color: '#ff8c00' },
+                { v: 'track',  label: 'Track+Fire', color: '#b44aff' },
+              ] as const).map(m => (
+                <div key={m.v} style={{
+                  padding: '8px', borderRadius: 6, textAlign: 'center',
+                  background: triggerMode === m.v ? `rgba(${m.v === 'manual' ? '0,212,255' : m.v === 'magnet' ? '255,140,0' : '180,74,255'},0.08)` : 'rgba(0,0,0,0.2)',
+                  border: `1px solid ${triggerMode === m.v ? m.color + '44' : 'rgba(0,212,255,0.06)'}`,
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: triggerMode === m.v ? m.color : 'rgba(126,200,227,0.4)' }}>{m.label}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'rgba(126,200,227,0.45)', marginBottom: 12 }}>
+              <div>
+                <span style={{ color: 'rgba(126,200,227,0.3)' }}>Hotkey </span>
+                <code style={{ color: '#ff8c00', background: 'rgba(255,140,0,0.08)', padding: '1px 5px', borderRadius: 3, fontFamily: 'JetBrains Mono' }}>
+                  {triggerbotHotkey}
+                </code>
+              </div>
+              <div>
+                <span style={{ color: 'rgba(126,200,227,0.3)' }}>Reaction </span>
+                <code style={{ color: '#ff8c00', background: 'rgba(255,140,0,0.08)', padding: '1px 5px', borderRadius: 3, fontFamily: 'JetBrains Mono' }}>
+                  {reactionTimeMs}ms
+                </code>
+              </div>
+            </div>
+
+            <button
+              className="btn btn-primary"
+              onClick={fireTriggerbot}
+              disabled={!connected || !triggerEnabled || triggerFiring}
+              style={{
+                width: '100%', justifyContent: 'center', fontSize: 13,
+                background: triggerEnabled && connected ? 'rgba(255,140,0,0.12)' : undefined,
+                borderColor: triggerEnabled && connected ? 'rgba(255,140,0,0.35)' : undefined,
+                color: triggerEnabled && connected ? '#ff8c00' : undefined,
+              }}>
+              {triggerFiring
+                ? <><span className="spinner" style={{ width: 13, height: 13 }} /> Firing…</>
+                : '⚡ Fire Now'}
+            </button>
+            {!triggerEnabled && (
+              <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.3)', textAlign: 'center', marginTop: 6 }}>
+                Enable triggerbot to use — configure mode &amp; hotkey in Settings
+              </div>
+            )}
           </div>
 
           {/* Macro Recorder */}

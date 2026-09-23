@@ -338,6 +338,22 @@ def serial_reconnect():
     return jsonify(result)
 
 
+@app.route('/api/serial/test', methods=['POST'])
+def serial_test():
+    """Send a tiny jog (5 right, then 5 left) to physically verify the MAKCU responds."""
+    if not serial_mgr.is_connected:
+        return jsonify({'ok': False, 'error': 'MAKCU not connected'}), 400
+    d = request.json or {}
+    jog = int(d.get('jog', 5))
+    r1 = serial_mgr.send_single(jog, 0)
+    if not r1['ok']:
+        return jsonify({'ok': False, 'error': f'Send failed: {r1.get("error", "unknown")}'})
+    time.sleep(0.025)
+    r2 = serial_mgr.send_single(-jog, 0)
+    ok = r1['ok'] and r2['ok']
+    return jsonify({'ok': ok, 'message': 'Test jog sent — cursor moved right then left', 'error': r2.get('error')})
+
+
 @app.route('/api/serial/macro/replay', methods=['POST'])
 def serial_macro_replay():
     """Replay a sequence of macro events through the connected MAKCU."""
