@@ -265,30 +265,39 @@ def push_target():
 #  smooth — gradual human-looking arc, 160ms travel, relaxed radius
 #
 AIM_MODES: dict[str, dict] = {
+    'flick': {
+        'max_movement_ms': 22,
+        'interval_ms':     0.5,
+        'cooldown_ms':     60,
+        'target_radius':   3,
+        'progress_center': 0.12,   # extreme front-load — done in first 12% of travel
+        'aim_height':      0.08,   # top of head
+        'desc':            'Ultra-fast flick — 22ms, top-of-head, pure speed',
+    },
     'snap': {
         'max_movement_ms': 40,
         'interval_ms':     0.5,
-        'cooldown_ms':     80,
-        'target_radius':   4,
-        'progress_center': 0.25,   # front-loaded curve → arrives early
+        'cooldown_ms':     70,
+        'target_radius':   5,
+        'progress_center': 0.18,   # very front-loaded → arrives by ~18% of travel
         'aim_height':      0.10,   # head level
-        'desc':            'Instant hard snap — fastest, most mechanical',
+        'desc':            'Instant hard snap — 40ms, head level, no lead',
     },
     'track': {
         'max_movement_ms': 80,
         'interval_ms':     1.0,
-        'cooldown_ms':     150,
-        'target_radius':   8,
-        'progress_center': 0.40,
+        'cooldown_ms':     120,
+        'target_radius':   10,
+        'progress_center': 0.38,
         'aim_height':      0.12,
         'desc':            'Continuous tracking with velocity prediction',
     },
     'smooth': {
-        'max_movement_ms': 160,
+        'max_movement_ms': 180,
         'interval_ms':     2.0,
         'cooldown_ms':     350,
         'target_radius':   14,
-        'progress_center': 0.55,   # symmetric, natural-looking arc
+        'progress_center': 0.50,   # symmetric arc — natural decel
         'aim_height':      0.15,   # upper chest
         'desc':            'Gradual human-like arc — least mechanical',
     },
@@ -403,9 +412,18 @@ def _run_detection(
     MAX_MISS       = 3       # frames of persistence before dropping target
     MAX_AIM_DIST   = 280.0   # ignore detections farther than this from crop center
 
+    # per-mode EMA alpha: snap/flick pass through raw; track/smooth blend positions
+    _SMOOTH_ALPHA = {'flick': 1.0, 'snap': 1.0, 'track': 0.72, 'smooth': 0.50}
+    _ema_alpha    = _SMOOTH_ALPHA.get(mode, 0.75)
+    # lower lead threshold for tracking modes (more responsive to slower targets)
+    _lead_thr     = 4.0 if mode in ('track', 'smooth') else 8.0
+    smoothed_px   = None           # EMA-filtered target position
+    tx_state      = {'firing': False}
+    tx_lock       = threading.Lock()
+
     # ── inner frame processor — shared by dxcam + mss paths ───────────────────
     def process_frame(frame: np.ndarray, cx_rel: int, cy_rel: int) -> None:
-        nonlocal last_fire, miss_frames, last_known_px
+        nonlocal last_fire, miss_frames, last_known_px, smoothed_px
         import torch as _torch
 
         with _torch.no_grad():
@@ -428,6 +446,12 @@ def _run_detection(
             miss_frames  = 0
             last_known_px = best_px
 
+            # EMA smoothing: snap/flick pass through raw; track/smooth blend
+            if smoothed_px is not None and _ema_alpha < 1.0:
+                px_x = _ema_alpha * px_x + (1.0 - _ema_alpha) * smoothed_px[0]
+                px_y = _ema_alpha * px_y + (1.0 - _ema_alpha) * smoothed_px[1]
+            smoothed_px = (px_x, px_y)
+
             # velocity tracking: weighted average of last 3 deltas (newest = highest weight)
             pos_history.append((now, px_x, px_y))
             vx = vy = 0.0
@@ -444,8 +468,8 @@ def _run_detection(
                 if total_w > 0:
                     vx, vy = w_vx / total_w, w_vy / total_w
 
-            # target lead: project aim forward by lead_ms only when target is actually moving
-            if lead_ms > 0 and (abs(vx) > 8 or abs(vy) > 8):
+            # target lead: project aim forward by lead_ms only when target is moving
+            if lead_ms > 0 and (abs(vx) > _lead_thr or abs(vy) > _lead_thr):
                 px_x += vx * (lead_ms / 1000.0)
                 px_y += vy * (lead_ms / 1000.0)
 
@@ -458,7 +482,9 @@ def _run_detection(
                 'vx':   round(vx, 1), 'vy': round(vy, 1),
             })
 
-            if (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
+            with tx_lock:
+                _can_fire = not tx_state['firing']
+            if _can_fire and (now - last_fire) * 1000 >= cooldown_ms and pipeline is not None and serial_mgr.is_connected:
                 cx_c = round(px_x * cpp)
                 cy_c = round(px_y * cpp)
                 try:
@@ -473,23 +499,31 @@ def _run_detection(
                         seed=int(now * 1000) % 10000,
                     ).tolist()[:max_reps]
                     if reports:
-                        serial_mgr.send_reports(reports, interval_ms, on_progress=lambda s, t: None)
+                        with tx_lock:
+                            tx_state['firing'] = True
                         last_fire = now
                         with _det_lock:
                             _det_state['hits'] += 1
 
-                        # recoil control: push mouse down after movement to counter upward camera kick
-                        # rcs_strength 0-1; ~4 counts per shot at full strength
-                        if rcs_strength > 0:
-                            rcs_counts = round(4.0 * rcs_strength)
-                            if rcs_counts > 0:
-                                _delay = max_movement_ms / 1000.0 * 0.8
-                                def _do_rcs(c=rcs_counts, d=_delay):
-                                    time.sleep(d)
-                                    serial_mgr.send_single(0, c)
-                                threading.Thread(target=_do_rcs, daemon=True).start()
+                        # Non-blocking TX: run serial write in daemon thread so detection
+                        # loop can keep capturing frames during the movement interval
+                        def _fire_async(rpts=reports, itv=interval_ms, rcs=rcs_strength, mvt=max_movement_ms):
+                            try:
+                                serial_mgr.send_reports(rpts, itv, on_progress=lambda s, t: None)
+                                if rcs > 0:
+                                    rcs_counts = round(4.0 * rcs)
+                                    if rcs_counts > 0:
+                                        time.sleep(mvt / 1000.0 * 0.8)
+                                        serial_mgr.send_single(0, rcs_counts)
+                            finally:
+                                with tx_lock:
+                                    tx_state['firing'] = False
+
+                        threading.Thread(target=_fire_async, daemon=True).start()
                 except Exception as exc:
                     logger.debug("Auto-fire error: %s", exc)
+                    with tx_lock:
+                        tx_state['firing'] = False
         else:
             miss_frames += 1
             if miss_frames <= MAX_MISS and last_known_px is not None:
@@ -498,6 +532,7 @@ def _run_detection(
             else:
                 miss_frames   = 0
                 last_known_px = None
+                smoothed_px   = None
                 with _det_lock:
                     _det_state['last_px']  = None
                     _det_state['velocity'] = None

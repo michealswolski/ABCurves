@@ -182,7 +182,7 @@ export const api = {
   detection: {
     start: (opts: {
       classes?: string[]
-      mode?: 'snap' | 'track' | 'smooth'
+      mode?: 'flick' | 'snap' | 'track' | 'smooth'
       confidence?: number
       cooldown_ms?: number
       fov_config?: { dpi: number; sensitivity: number; fovH: number; screenW: number }

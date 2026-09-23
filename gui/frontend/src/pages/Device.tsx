@@ -62,11 +62,14 @@ export default function Device() {
   const [detConfidence, setDetConfidence] = useState(0.25)
   const [detCooldown, setDetCooldown]     = useState(150)
   const [detStarting, setDetStarting]     = useState(false)
-  const [detMode, setDetMode]             = useState<'snap'|'track'|'smooth'>('track')
+  const [detMode, setDetMode]             = useState<'flick'|'snap'|'track'|'smooth'>('track')
   const [detAimHeight, setDetAimHeight]   = useState(0.12)
   const [detLeadMs, setDetLeadMs]         = useState(30)
   const [detRcs, setDetRcs]               = useState(0)
   const [detVelocity, setDetVelocity]     = useState<[number,number]|null>(null)
+  const [detTarget, setDetTarget]         = useState(false)
+  const [detDpi, setDetDpi]               = useState(400)
+  const [detSens, setDetSens]             = useState(3.26)
 
   // Triggerbot state (synced from Settings)
   const [triggerEnabled, setTriggerEnabled] = useState(() =>
@@ -298,9 +301,11 @@ export default function Device() {
         setDetFps(s.fps)
         setDetHits(s.hits)
         setDetVelocity(s.velocity ?? null)
+        setDetTarget(!!(s.last_px))
         if (!s.running) {
           setDetRunning(false)
           setDetVelocity(null)
+          setDetTarget(false)
           addLog('Auto-detect stopped', 'log-warn')
         }
       } catch {}
@@ -324,9 +329,9 @@ export default function Device() {
         mode:         detMode,
         confidence:   detConfidence,
         cooldown_ms:  detCooldown,
-        fov_config:   { dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 },
+        fov_config:   { dpi: detDpi, sensitivity: detSens, fovH: 106.26, screenW: 2560 },
         aim_height:   detAimHeight,
-        lead_ms:      detMode === 'snap' ? 0 : detLeadMs,
+        lead_ms:      (detMode === 'snap' || detMode === 'flick') ? 0 : detLeadMs,
         rcs_strength: detRcs / 100,
       })
       if (r.ok) {
@@ -342,7 +347,7 @@ export default function Device() {
     } finally {
       setDetStarting(false)
     }
-  }, [detRunning, detClasses, detConfidence, detCooldown, detMode, detAimHeight, detLeadMs, detRcs, addLog])
+  }, [detRunning, detClasses, detConfidence, detCooldown, detMode, detAimHeight, detLeadMs, detRcs, detDpi, detSens, addLog])
 
   // Load default quickfire params from example data
   const [loadingDefault, setLoadingDefault] = useState(false)
@@ -1023,18 +1028,19 @@ export default function Device() {
                 borderRadius: 6, overflow: 'hidden',
               }}>
                 {([
-                  ['FPS',   String(detFps)],
-                  ['Shots', String(detHits)],
-                  ['Mode',  detMode.toUpperCase()],
-                  ['Vel ↔', detVelocity ? `${detVelocity[0] > 0 ? '+' : ''}${Math.round(detVelocity[0])}` : '—'],
-                  ['Vel ↕', detVelocity ? `${detVelocity[1] > 0 ? '+' : ''}${Math.round(detVelocity[1])}` : '—'],
-                ] as [string, string][]).map(([l, v], i) => (
+                  ['FPS',   String(detFps),   null],
+                  ['Shots', String(detHits),  null],
+                  ['Mode',  detMode.toUpperCase(), null],
+                  ['Lock',  detTarget ? '●' : '○', detTarget ? '#00ff88' : undefined],
+                  ['Vel ↔', detVelocity ? `${detVelocity[0] > 0 ? '+' : ''}${Math.round(detVelocity[0])}` : '—', null],
+                  ['Vel ↕', detVelocity ? `${detVelocity[1] > 0 ? '+' : ''}${Math.round(detVelocity[1])}` : '—', null],
+                ] as [string, string, string|null][]).map(([l, v, c], i) => (
                   <div key={l} style={{
                     flex: 1, padding: '8px 6px', textAlign: 'center',
-                    borderRight: i < 4 ? '1px solid rgba(180,74,255,0.08)' : undefined,
+                    borderRight: i < 5 ? '1px solid rgba(180,74,255,0.08)' : undefined,
                   }}>
                     <div style={{ fontSize: 9, color: 'rgba(126,200,227,0.35)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{l}</div>
-                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 13, color: '#b44aff', fontWeight: 700 }}>{v}</div>
+                    <div style={{ fontFamily: 'JetBrains Mono', fontSize: 13, color: c ?? '#b44aff', fontWeight: 700 }}>{v}</div>
                   </div>
                 ))}
               </div>
@@ -1045,15 +1051,16 @@ export default function Device() {
               <label className="form-label">Aim Mode</label>
               <div style={{ display: 'flex', gap: 4 }}>
                 {([
-                  { v: 'snap',   label: 'SNAP',   color: '#ff4444', desc: '40ms snap · head level · no lead' },
-                  { v: 'track',  label: 'TRACK',  color: '#b44aff', desc: '80ms tracking · velocity lead · balanced' },
-                  { v: 'smooth', label: 'SMOOTH', color: '#00d4ff', desc: '160ms arc · chest aim · human-like' },
+                  { v: 'flick',  label: 'FLICK',  color: '#ff8800' },
+                  { v: 'snap',   label: 'SNAP',   color: '#ff4444' },
+                  { v: 'track',  label: 'TRACK',  color: '#b44aff' },
+                  { v: 'smooth', label: 'SMOOTH', color: '#00d4ff' },
                 ] as const).map(m => (
                   <button key={m.v} onClick={() => {
                     if (!detRunning) {
                       setDetMode(m.v)
-                      setDetCooldown(m.v === 'snap' ? 80 : m.v === 'track' ? 150 : 350)
-                      setDetAimHeight(m.v === 'snap' ? 0.10 : m.v === 'track' ? 0.12 : 0.15)
+                      setDetCooldown(m.v === 'flick' ? 60 : m.v === 'snap' ? 70 : m.v === 'track' ? 120 : 350)
+                      setDetAimHeight(m.v === 'flick' ? 0.08 : m.v === 'snap' ? 0.10 : m.v === 'track' ? 0.12 : 0.15)
                     }
                   }} disabled={detRunning} style={{
                     flex: 1, padding: '6px 4px', border: `1px solid ${detMode === m.v ? m.color : 'rgba(126,200,227,0.12)'}`,
@@ -1065,7 +1072,24 @@ export default function Device() {
                 ))}
               </div>
               <div style={{ fontSize: 10, color: 'rgba(126,200,227,0.35)', marginTop: 4 }}>
-                {detMode === 'snap' ? '40ms snap · head level · no lead' : detMode === 'track' ? '80ms tracking · velocity lead · balanced' : '160ms arc · chest aim · human-like'}
+                {detMode === 'flick' ? '22ms · top-of-head · no lead · pure speed'
+                  : detMode === 'snap' ? '40ms · head level · no lead'
+                  : detMode === 'track' ? '80ms · velocity lead · balanced'
+                  : '180ms arc · chest aim · human-like'}
+              </div>
+            </div>
+
+            {/* DPI + Sensitivity */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+              <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                <label className="form-label">Mouse DPI</label>
+                <input className="form-input" type="number" min={200} max={32000} step={100}
+                  value={detDpi} onChange={e => setDetDpi(Number(e.target.value))} disabled={detRunning} />
+              </div>
+              <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
+                <label className="form-label">In-game Sens</label>
+                <input className="form-input" type="number" min={0.1} max={20} step={0.01}
+                  value={detSens} onChange={e => setDetSens(Number(e.target.value))} disabled={detRunning} />
               </div>
             </div>
 
