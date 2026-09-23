@@ -381,16 +381,6 @@ export default function MovementCanvas({
   useEffect(() => { drawStatic() }, [drawStatic])
   useEffect(() => () => cancelAnimationFrame(animRef.current), [])
 
-  // Keyboard shortcut: R = replay animation
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement).tagName.toLowerCase()
-      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
-      if (e.key === 'r' || e.key === 'R') playAnimation()
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [playAnimation])
 
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!onTargetClick) return
@@ -422,10 +412,10 @@ export default function MovementCanvas({
         {onTargetClick && (
           <div style={{
             position: 'absolute', top: 8, right: 10, zIndex: 2,
-            fontSize: 10, color: 'rgba(255,45,120,0.5)', fontFamily: 'JetBrains Mono',
+            fontSize: 10, color: 'rgba(255,45,120,0.4)', fontFamily: 'JetBrains Mono',
             pointerEvents: 'none',
           }}>
-            Click to set target
+            Click canvas to set target
           </div>
         )}
         <canvas
@@ -460,11 +450,11 @@ export default function MovementCanvas({
           disabled={animating || isEmpty}
         >
           {animating
-            ? <><span className="spinner" style={{ width: 14, height: 14 }} /> Animating…</>
-            : '▶  Replay'}
+            ? <><span className="spinner" style={{ width: 14, height: 14 }} /> Playing…</>
+            : '▶  Play Animation'}
         </button>
         <button className="btn btn-secondary" onClick={drawStatic} disabled={animating}>
-          ⊞ Reset
+          ↺ Reset View
         </button>
       </div>
     </div>

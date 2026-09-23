@@ -38,10 +38,7 @@ function PixelConverter({ countsPerPixel, onConvert }: {
           border: 'none', cursor: 'pointer', padding: '2px 0', letterSpacing: '0.05em',
         }}
       >
-        {open ? '▾' : '▸'} convert from pixels
-        <span style={{ color: 'rgba(0,212,255,0.3)', marginLeft: 6 }}>
-          ({countsPerPixel.toFixed(3)} cpp)
-        </span>
+        {open ? '▾' : '▸'} enter in pixels instead
       </button>
       {open && (
         <div style={{ display: 'flex', gap: 6, marginTop: 4, alignItems: 'flex-end' }}>
@@ -515,7 +512,7 @@ export default function Inference() {
             background: 'rgba(5,5,18,0.9)',
             border: connected ? '1px solid rgba(57,255,20,0.2)' : '1px solid rgba(0,212,255,0.1)',
           }}>
-            <div className="section-header"><Usb size={13} /> MAKCU Output</div>
+            <div className="section-header"><Usb size={13} /> Send to Device</div>
 
             <div style={{
               display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14,
@@ -538,11 +535,6 @@ export default function Inference() {
               }
             </div>
 
-            <InputRow label="Report Interval (ms)" hint="1.0 ms = 1 kHz matching real 1kHz output rate">
-              <input type="number" className="form-input" style={{ width: '100%' }}
-                value={intervalMs} min={0} max={100} step={0.5}
-                onChange={e => setIntervalMs(Number(e.target.value))} />
-            </InputRow>
 
             {sendProgress && (
               <div style={{ marginBottom: 12 }}>
@@ -569,15 +561,6 @@ export default function Inference() {
                 : <><Send size={14} /> Send to MAKCU</>}
             </button>
 
-            {result && (
-              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.35)', marginTop: 8, textAlign: 'center' }}>
-                {trimmedContinuation.length} reports
-                {trimmedContinuation.length < result.stats.continuation_length && (
-                  <span style={{ color: 'rgba(0,212,255,0.4)' }}> (trimmed from {result.stats.continuation_length})</span>
-                )}
-                {' '}· ~{(trimmedContinuation.length * intervalMs).toFixed(0)} ms total
-              </div>
-            )}
           </div>
         </div>
 
@@ -585,10 +568,7 @@ export default function Inference() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <div className="card" style={{ background: 'rgba(5,5,18,0.9)', padding: 16 }}>
             <div className="section-header" style={{ marginBottom: 10 }}>
-              Movement Visualization
-              <span style={{ marginLeft: 8, fontSize: 10, color: 'rgba(255,45,120,0.4)', fontFamily: 'JetBrains Mono' }}>
-                Click to set target
-              </span>
+              Movement Preview
             </div>
             <MovementCanvas
               prefix={prefix}
@@ -637,7 +617,7 @@ export default function Inference() {
           {result && (
             <div className="card" style={{ background: 'rgba(5,5,18,0.9)' }}>
               <div className="section-header" style={{ marginBottom: 12 }}>
-                Inference Results
+                Results
                 {/* Export buttons */}
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
                   <button className="btn btn-secondary"
@@ -654,9 +634,9 @@ export default function Inference() {
               </div>
               <div className="grid-3" style={{ gap: 12 }}>
                 {[
-                  ['Prefix Length',        result.stats.prefix_length,        '#00d4ff'],
-                  ['Continuation Points',  result.stats.continuation_length,  '#39ff14'],
-                  ['Total Reports',        result.stats.total_length,         '#b44aff'],
+                  ['Input Points',   result.stats.prefix_length,       '#00d4ff'],
+                  ['Move Steps',     trimmedContinuation.length,        '#39ff14'],
+                  ['Duration',       `~${(trimmedContinuation.length * intervalMs).toFixed(0)}ms`, '#b44aff'],
                 ].map(([label, value, color]) => (
                   <div key={label as string} style={{
                     background: 'rgba(0,212,255,0.04)', borderRadius: 8,
@@ -680,35 +660,12 @@ export default function Inference() {
                   background: 'rgba(255,140,0,0.05)', border: '1px solid rgba(255,140,0,0.12)',
                   display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
                 }}>
-                  <span style={{ color: 'rgba(126,200,227,0.4)', fontSize: 11 }}>Inference latency</span>
+                  <span style={{ color: 'rgba(126,200,227,0.4)', fontSize: 11 }}>Generated in</span>
                   <span style={{ color: '#ff8c00', fontFamily: 'JetBrains Mono', fontWeight: 700 }}>
                     {result.latency_ms.toFixed(1)} ms
                   </span>
-                  <span style={{ color: 'rgba(57,255,20,0.5)', marginLeft: 'auto', fontSize: 11 }}>
-                    🛡 0/1280 caught in cold tests
-                  </span>
                 </div>
               )}
-
-              <div style={{ marginTop: 16 }}>
-                <div className="section-header">Generated Trajectory (first 16 deltas)</div>
-                <div style={{
-                  background: 'rgba(0,4,14,0.95)', borderRadius: 6, padding: '12px 14px',
-                  fontFamily: 'JetBrains Mono', fontSize: 11, color: '#39ff14',
-                  border: '1px solid rgba(57,255,20,0.1)', lineHeight: 1.8,
-                }}>
-                  {result.continuation.slice(0, 16).map((p, i) => (
-                    <span key={i} style={{ marginRight: 10, display: 'inline-block' }}>
-                      [{(p as [number,number])[0]}, {(p as [number,number])[1]}]
-                    </span>
-                  ))}
-                  {result.continuation.length > 16 && (
-                    <span style={{ color: 'rgba(126,200,227,0.3)' }}>
-                      … +{result.continuation.length - 16} more
-                    </span>
-                  )}
-                </div>
-              </div>
             </div>
           )}
 
@@ -724,12 +681,11 @@ export default function Inference() {
                 Ready to generate
               </div>
               <div style={{ fontSize: 12, color: 'rgba(126,200,227,0.3)' }}>
-                Click <b style={{ color: '#00d4ff' }}>Run Inference</b> to generate a realistic B→C movement,
-                or press <b style={{ color: '#00d4ff' }}>Space</b>. Then{' '}
-                <b style={{ color: '#39ff14' }}>Send to MAKCU</b> to inject it as real mouse input.
+                Set a target above, click <b style={{ color: '#00d4ff' }}>Generate Movement</b>,
+                then <b style={{ color: '#39ff14' }}>Send to MAKCU</b>.
               </div>
-              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.2)', marginTop: 12 }}>
-                Click on the canvas above to set the target position visually
+              <div style={{ fontSize: 11, color: 'rgba(126,200,227,0.2)', marginTop: 8 }}>
+                Or click directly on the canvas to aim at a point visually
               </div>
             </div>
           )}
