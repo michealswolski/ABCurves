@@ -394,14 +394,18 @@ def _run_detection(
     cpp = (dpi / 400) / (sens * 0.022) * (fovH / sw)
 
     max_reps     = math.ceil(max_movement_ms / max(interval_ms, 0.5))
-    last_fire    = 0.0
-    frame_ts:    list  = []
+    last_fire      = 0.0
+    frame_ts:  list  = []
     pos_history: deque = deque(maxlen=8)   # (time, px_x, px_y)
-    crop         = 640
+    crop           = 640
+    miss_frames    = 0       # consecutive frames with no detection
+    last_known_px  = None    # carry last position across up to 3 missed frames
+    MAX_MISS       = 3       # frames of persistence before dropping target
+    MAX_AIM_DIST   = 280.0   # ignore detections farther than this from crop center
 
     # ── inner frame processor — shared by dxcam + mss paths ───────────────────
     def process_frame(frame: np.ndarray, cx_rel: int, cy_rel: int) -> None:
-        nonlocal last_fire
+        nonlocal last_fire, miss_frames, last_known_px
         import torch as _torch
 
         with _torch.no_grad():
@@ -414,13 +418,15 @@ def _run_detection(
                 bx   = (box[0] + box[2]) / 2
                 by   = box[1] + (box[3] - box[1]) * aim_height
                 dist = ((bx - cx_rel) ** 2 + (by - cy_rel) ** 2) ** 0.5
-                if dist < best_dist:
+                if dist < best_dist and dist <= MAX_AIM_DIST:
                     best_dist, best_px = dist, (bx - cx_rel, by - cy_rel)
 
         now = time.time()
 
         if best_px:
-            px_x, px_y = best_px
+            px_x, px_y   = best_px
+            miss_frames  = 0
+            last_known_px = best_px
 
             # velocity tracking: weighted average of last 3 deltas (newest = highest weight)
             pos_history.append((now, px_x, px_y))
@@ -485,15 +491,26 @@ def _run_detection(
                 except Exception as exc:
                     logger.debug("Auto-fire error: %s", exc)
         else:
-            with _det_lock:
-                _det_state['last_px']  = None
-                _det_state['velocity'] = None
-            pos_history.clear()
+            miss_frames += 1
+            if miss_frames <= MAX_MISS and last_known_px is not None:
+                # Hold last known position briefly — smooths 1-2 frame dropouts
+                pass
+            else:
+                miss_frames   = 0
+                last_known_px = None
+                with _det_lock:
+                    _det_state['last_px']  = None
+                    _det_state['velocity'] = None
+                pos_history.clear()
 
     # ── capture + inference loop ───────────────────────────────────────────────
     try:
         if _use_dxcam:
             import ctypes, dxcam as _dxcam
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)  # physical pixels
+            except Exception:
+                pass
             mw = ctypes.windll.user32.GetSystemMetrics(0)
             mh = ctypes.windll.user32.GetSystemMetrics(1)
             region = (mw // 2 - crop // 2, mh // 2 - crop // 2,
