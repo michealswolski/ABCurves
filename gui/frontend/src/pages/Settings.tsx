@@ -11,14 +11,15 @@ const FOV_PRESETS = [
 ]
 
 const RESOLUTIONS = [
-  { label: '1920×1080', w: 1920 },
   { label: '2560×1440', w: 2560 },
-  { label: '1280×720',  w: 1280 },
+  { label: '1920×1080', w: 1920 },
+  { label: '3840×2160', w: 3840 },
   { label: '2560×1080', w: 2560 },
+  { label: '1280×720',  w: 1280 },
 ]
 
 function defaultFovConfig() {
-  return { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 1920 }
+  return { game: 'cs2', dpi: 400, sensitivity: 3.2554, fovH: 106.26, screenW: 2560 }
 }
 
 function formatKey(key: string): string {
@@ -420,10 +421,14 @@ export default function Settings() {
             </div>
             <div className="form-group" style={{ marginBottom: 0 }}>
               <label className="form-label">Screen Width (px)</label>
-              <select className="form-input" value={fovConfig.screenW}
-                onChange={e => updateFov({ screenW: Number(e.target.value) })}>
+              <select className="form-input"
+                value={RESOLUTIONS.find(r => r.w === fovConfig.screenW)?.label ?? String(fovConfig.screenW)}
+                onChange={e => {
+                  const r = RESOLUTIONS.find(res => res.label === e.target.value)
+                  if (r) updateFov({ screenW: r.w })
+                }}>
                 {RESOLUTIONS.map(r => (
-                  <option key={r.label} value={r.w}>{r.label}</option>
+                  <option key={r.label} value={r.label}>{r.label}</option>
                 ))}
               </select>
             </div>
